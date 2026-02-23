@@ -1,0 +1,155 @@
+---
+title: "Cook County Electricity Demand Time Series Modeling - Simple Methods"
+output: html_document
+---
+
+# Load libraries
+
+```{r,warning=F,message=F}
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(dplyr)
+
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+```
+
+# Load Data
+
+```{r}
+df_1819 <- readRDS("data/train_test_split/df_1819.rds")
+df_2020   <- readRDS("data/train_test_split/df_20.rds")
+```
+
+# Modeling
+
+### Simple Methods (Baselines)
+
+```{r}
+# train
+ts_1819 <- ts(df_1819$electricity_demand, frequency = 24)
+
+# test
+ts_2020 <- ts(
+  df_2020$electricity_demand,
+  frequency = 24,
+  start = time(ts_1819)[length(ts_1819)] + 1/frequency(ts_1819)
+)
+
+# seasonal naive
+fit_snaive <- snaive(ts_1819, h = length(ts_2020))
+
+# plot
+autoplot(fit_snaive) +
+  autolayer(ts_2020, series = "Actual Demand (Jan 2020)", color = "red") +
+  coord_cartesian(xlim = c(max(time(ts_1819)) - 10, max(time(ts_2020)))) +
+  labs(title = "Seasonal Naive Forecast vs Actual",
+       x = "Time (Days)",
+       y = "Electricity Demand") +
+  theme_minimal()
+
+# accuracy
+acc_snaive <- accuracy(fit_snaive, ts_2020)
+print(acc_snaive)
+
+checkresiduals(fit_snaive)
+```
+
+The plot compares this repeated daily profile against the January 2020 actual demand, so any persistent gap indicates level changes or calendar/weather-driven shifts not present at the end of 2019. Quantitatively, the test MAPE is about 5.25%, which is a reasonable benchmark, but the very high residual autocorrelation suggests substantial remaining structure beyond simple daily seasonality.
+
+```{r}
+# Fit Mean Forecast model
+fit_mean <- meanf(ts_1819, h = length(ts_2020))
+
+# Plot the Mean forecast
+autoplot(fit_mean, PI = FALSE, series = "Mean Forecast") +
+  autolayer(ts_2020, series = "Actual Demand (Jan 2020)", color = "red") +
+  coord_cartesian(xlim = c(max(time(ts_1819)) - 10, max(time(ts_2020)))) +
+  labs(title = "Mean Forecast vs Actual",
+       x = "Time (Days)",
+       y = "Electricity Demand") +
+  theme_minimal() +
+  scale_color_manual(values = c("Actual Demand (Jan 2020)" = "red", "Mean Forecast" = "blue"))
+
+# Evaluate accuracy bypassing ts index mismatch
+acc_mean <- accuracy(fit_mean, df_2020$electricity_demand)
+print(acc_mean)
+
+```
+
+```{r}
+# Fit STLF model
+fit_stlf <- stlf(ts_1819, method = "naive", h = length(ts_2020))
+
+# Plot the STLF forecast
+autoplot(fit_stlf, PI = FALSE, series = "STLF Forecast") +
+  autolayer(ts_2020, series = "Actual Demand (Jan 2020)", color = "red") +
+  coord_cartesian(xlim = c(max(time(ts_1819)) - 10, max(time(ts_2020)))) +
+  labs(title = "STLF Forecast vs Actual",
+       x = "Time (Days)",
+       y = "Electricity Demand") +
+  theme_minimal() +
+  scale_color_manual(values = c("Actual Demand (Jan 2020)" = "red", "STLF Forecast" = "blue"))
+
+# Evaluate accuracy
+acc_stlf <- accuracy(fit_stlf, df_2020$electricity_demand)
+print(acc_stlf)
+
+```
+
+```{r}
+#Time Series Linear Model (TSLM) & Diagnostics
+library(lmtest)
+
+# Fit TSLM with trend and daily seasonality
+fit_tslm <- tslm(ts_1819 ~ trend + season)
+summary(fit_tslm)
+
+autoplot(window(ts_1819, start = time(ts_1819)[length(ts_1819) - 336])) +
+  autolayer(window(fitted(fit_tslm), start = time(ts_1819)[length(ts_1819) - 336]), 
+            series = "Fitted (TSLM)", size = 0.8) +
+  labs(title = "TSLM: Actual vs. Fitted (Last 14 Days of Training)",
+       x = "Time",
+       y = "Electricity Demand") +
+  theme_minimal() +
+  scale_color_manual(values = c("Data" = "black", "Fitted (TSLM)" = "red"))
+
+# Residual Diagnostics
+res_tslm <- residuals(fit_tslm)
+
+# Plot Residuals Time Plot
+autoplot(res_tslm) +
+  labs(title = "Residuals from TSLM", y = "Residuals") +
+  theme_minimal()
+
+# Plot ACF of Residuals
+ggAcf(res_tslm, lag.max = 48) +
+  labs(title = "ACF of TSLM Residuals")
+
+# Plot Histogram of Residuals
+hist(res_tslm, breaks = 50, col = "lightblue", 
+     main = "Histogram of TSLM Residuals", xlab = "Residuals")
+
+# Ljung-Box Test
+Box.test(res_tslm, lag = 24, type = "Ljung-Box")
+
+# Breusch-Godfrey Test
+bgtest(fit_tslm)
+
+# Forecast and Plot
+fcast_tslm <- forecast(fit_tslm, h = length(df_2020$electricity_demand))
+
+autoplot(fcast_tslm, PI = FALSE, series = "TSLM Forecast") +
+  autolayer(ts_2020, series = "Actual Demand (Jan 2020)") +
+  coord_cartesian(xlim = c(max(time(ts_1819)) - 10, max(time(ts_2020)))) +
+  labs(title = "TSLM Forecast vs Actual",
+       x = "Time (Days)",
+       y = "Electricity Demand") +
+  theme_minimal() +
+  scale_color_manual(values = c("Actual Demand (Jan 2020)" = "red", "TSLM Forecast" = "blue"))
+
+acc_tslm <- accuracy(fcast_tslm, df_2020$electricity_demand)
+print(acc_tslm)
+```
+
+For visualization purposes, only the last 14 days of the testing period are shown. This window includes multiple daily and weekly seasonal cycles, making it sufficient to evaluate forecast alignment while maintaining visual clarity.
