@@ -1,0 +1,202 @@
+---
+title: "Cook County Electricity Demand Time Series Modeling Handbook"
+output: html_document
+---
+
+```{r,warning=F,message=F}
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(future.apply)
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+```
+
+```{r}
+# load data
+df_1819 <- readRDS("data/train_test_split/df_1819.rds")
+df_20   <- readRDS("data/train_test_split/df_20.rds")
+
+# convert into expected datatype
+ts_1819 <- ts(df_1819$electricity_demand, frequency = 24)
+ts_20   <- ts(df_20$electricity_demand, frequency = 24)
+```
+
+## Train - Validation - Test Framework
+
+1.  Data is split into train & test data.
+2.  Models will be trained and tuned using `train data`. Different or tailored train - validation structure might be used accordingly. This file provide a sample structure.
+3.  All the models will be evaluated on the forecasting performance on the test data.
+4.  Metrics consider AICc, RMSE, MAE and MAPE.
+
+**Note**: Train-validation procedure can be different, while the test output should strictly follow the same pattern.
+
+### Data Size & hyperparameters for train - validation
+
+| parameter | meaning                 |
+|-----------|-------------------------|
+| k         | initial training window |
+| H         | forecast horizon        |
+| stride    | sliding steps           |
+| p         | seasonal period         |
+| I         | number of iterations    |
+
+```{r}
+k      <- 24 * 365       # initial training window: 1 year
+# k      <- 24 * 365 * 1.5 # 1.5 year
+# H      <- 24             # validation horizon: 24 hours (day-ahead)
+H      <- 24 * 7         # week-ahead
+stride <- 24*7
+
+p <- frequency(ts_1819)
+n <- length(ts_1819)
+I <- floor((n - k - H)/stride)  # iterations count based on stride
+I                               # check number of iterations for the computing time estimate
+```
+
+### Cross Validation Framework
+
+ETS auto fit as example
+
+#### Setting
+
+```{r}
+# Containers
+make_store <- function(I, H) list(err = matrix(NA_real_, I, H), aicc = rep(NA_real_, I))
+ets_exp <- make_store(I, H)
+ets_sld <- make_store(I, H)
+
+# Model fit function
+fit_ets <- function(y_train) {
+  ets(y_train)   # auto ETS
+}
+
+# Helper: index -> ts time (works for any ts frequency)
+idx2time <- function(x_ts, idx) {
+  tp <- tsp(x_ts)       # c(start, end, frequency)
+  st <- tp[1]
+  p  <- tp[3]
+  st + (idx - 1) / p
+}
+
+# Metrics helpers (per-iteration)
+mae_iter  <- function(err_mat) apply(abs(err_mat), 1, mean, na.rm = TRUE)
+rmse_iter <- function(err_mat) apply(err_mat^2, 1, function(x) sqrt(mean(x, na.rm = TRUE)))
+```
+
+#### CV loop
+
+```{r}
+# Use multisession for Windows; multicore for Mac/Linux is faster.
+plan(multisession, workers = 16 )
+
+# One-iteration worker
+one_iter <- function(i, x_ts, k, H, stride, n) {
+  
+  # train - valid window split
+  exp_end   <- k + (i - 1) * stride
+  sld_start <- 1 + (i - 1) * stride
+  sld_end   <- exp_end
+
+  val_start <- exp_end + 1
+  val_end   <- min(val_start + H - 1, n)
+  L <- val_end - val_start + 1
+
+  exp_end_t   <- idx2time(x_ts, exp_end)
+  sld_start_t <- idx2time(x_ts, sld_start)
+  sld_end_t   <- exp_end_t
+  val_start_t <- idx2time(x_ts, val_start)
+  val_end_t   <- idx2time(x_ts, val_end)
+
+  y_exp   <- window(x_ts, end   = exp_end_t)
+  y_sld   <- window(x_ts, start = sld_start_t, end = sld_end_t)
+  y_valid <- window(x_ts, start = val_start_t, end = val_end_t)
+
+  # expanding
+  m_exp <- fit_ets(y_exp)
+  f_exp <- forecast(m_exp, h = H)
+  err_exp <- rep(NA_real_, H)
+  err_exp[1:L] <- as.numeric(f_exp$mean[1:L] - y_valid)
+
+  # sliding
+  m_sld <- fit_ets(y_sld)
+  f_sld <- forecast(m_sld, h = H)
+  err_sld <- rep(NA_real_, H)
+  err_sld[1:L] <- as.numeric(f_sld$mean[1:L] - y_valid)
+  
+  # returns a list with exp/sld errors + aicc
+  list(
+    err_exp  = err_exp,
+    aicc_exp = m_exp$aicc,
+    err_sld  = err_sld,
+    aicc_sld = m_sld$aicc
+  )
+}
+```
+
+```{r}
+# Run CV in parallel
+# future.seed=TRUE ensures reproducibility if any randomness appears
+res <- future_lapply(
+  X = seq_len(I),
+  FUN = one_iter,
+  x_ts = ts_1819, k = k, H = H, stride = stride, n = n,
+  future.seed = TRUE
+)
+```
+
+#### Evaluate on validation data
+
+```{r}
+# Collect results into same store structure
+ets_exp <- make_store(I, H)
+ets_sld <- make_store(I, H)
+
+for (i in seq_len(I)) {
+  ets_exp$err[i, ]  <- res[[i]]$err_exp
+  ets_exp$aicc[i]   <- res[[i]]$aicc_exp
+  ets_sld$err[i, ]  <- res[[i]]$err_sld
+  ets_sld$aicc[i]   <- res[[i]]$aicc_sld
+}
+```
+
+```{r}
+# Summaries (same as your template)
+mae_ets_exp_mean  <- mean(mae_iter(ets_exp$err),  na.rm = TRUE)
+rmse_ets_exp_mean <- mean(rmse_iter(ets_exp$err), na.rm = TRUE)
+aicc_ets_exp_mean <- mean(ets_exp$aicc,           na.rm = TRUE)
+
+mae_ets_sld_mean  <- mean(mae_iter(ets_sld$err),  na.rm = TRUE)
+rmse_ets_sld_mean <- mean(rmse_iter(ets_sld$err), na.rm = TRUE)
+aicc_ets_sld_mean <- mean(ets_sld$aicc,           na.rm = TRUE)
+
+df_summary <- data.frame(
+  Model     = c("ETS Expanding", "ETS Sliding"),
+  Mean_MAE  = c(mae_ets_exp_mean,  mae_ets_sld_mean),
+  Mean_RMSE = c(rmse_ets_exp_mean, rmse_ets_sld_mean),
+  Mean_AICc = c(aicc_ets_exp_mean, aicc_ets_sld_mean)
+)
+
+df_summary
+```
+
+### Forecast output on Test Data
+
+```{r}
+modeling_method <- "ETS_Sample"
+forecast_path  <- paste0("data/test_forecast/", modeling_method, "_20Jan.csv")
+
+h_fc   <- nrow(df_20)
+ts_out <- df_20$timestamp
+
+fit_ets <- ets(ts_1819)
+fc_ets  <- forecast(fit_ets, h = h_fc)
+y_pred  <- as.numeric(fc_ets$mean)
+
+test_forecast <- tibble(
+  timestamp = ts_out,
+  y_pred    = y_pred
+)
+write.csv(test_forecast, forecast_path, row.names = FALSE)
+```
