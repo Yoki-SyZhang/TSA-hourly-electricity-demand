@@ -192,7 +192,7 @@ ts_out <- df_20$timestamp
 
 fit_ets <- ets(ts_1819)
 fc_test  <- forecast(fit_ets, h = h_fc)
-y_pred  <- as.numeric(fc_ets$mean)
+y_pred  <- as.numeric(fc_test$mean)
 
 forecast_df_test <- data.frame(
   timestamp = ts_out,
