@@ -383,26 +383,26 @@ plot_train_valid_forecast <- function(
 weather_vars <- c("winter_HDH", "winter_wind", "summer_CDH", "summer_dew")
 Xreg_train_subset1 <- xreg_train[, weather_vars, drop = FALSE]
 
-fit_sarima_d1D1_1 <- auto.arima(
+fit_sarima_D1_1 <- auto.arima(
   y_train_ts,
   xreg = Xreg_train_subset1,
   seasonal = TRUE,
   stepwise = TRUE,
   approximation = TRUE,
-  d = 1, D = 1,
+  d = 0, D = 1,
   max.p = 4, max.q = 4,
-  max.P = 3, max.Q = 3
+  max.P = 4, max.Q = 4
 )
 
-summary(fit_sarima_d1D1_1)
+summary(fit_sarima_D1_1)
 ```
 
 **Check Residuals**
 ```{r fig.width=12, fig.height=6}
-plot_residual_diag(fit_sarima_d1D1_1, y_train$timestamp)
+plot_residual_diag(fit_sarima_D1_1, y_train$timestamp)
 ```
 ```{r}
-plot_residual_acf_longlag(fit_sarima_d1D1_1)
+plot_residual_acf_longlag(fit_sarima_D1_1)
 ```
 
 
@@ -411,25 +411,21 @@ plot_residual_acf_longlag(fit_sarima_d1D1_1)
 weather_vars <- weather_vars
 xreg_val_subset <- xreg_val[, weather_vars, drop = FALSE]
 
-fc_sarima_d1D1_1 <- forecast(fit_sarima_d1D1_1, h = H_val, xreg = xreg_val_subset)
+fc_sarima_D1_1 <- forecast(fit_sarima_D1_1, h = H_val, xreg = xreg_val_subset)
 ```
 
 
 ```{r}
-
-
-calc_metrics(y_val_ts, fc_sarima_d1D1_1$mean)
+calc_metrics(y_val_ts, fc_sarima_D1_1$mean)
 ```
 
 ```{r fig.width=12, fig.height=4}
-
-
 plot_train_valid_forecast(
   y_train = y_train,
   y_train_ts = y_train_ts,
   y_val = y_val,
   y_valid_vec = y_valid_vec,
-  fc_obj = fc_sarima_d1D1_1,
+  fc_obj = fc_sarima_D1_1,
   ci_level = 2,
   lookback_days = 7*12
 )
