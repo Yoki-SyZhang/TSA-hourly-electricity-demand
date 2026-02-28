@@ -5,6 +5,7 @@ output: html_document
 
 ```{r,warning=F,message=F}
 library(forecast)
+library(readr)
 library(tseries)
 library(ggplot2)
 library(dplyr)
@@ -16,163 +17,240 @@ Sys.setlocale("LC_ALL", "en_US.UTF-8")
 ```{r}
 # load data
 df_1819 <- readRDS("data/train_test_split/df_1819.rds")
+df_1819 <- df_1819[-1, ]
 df_20   <- readRDS("data/train_test_split/df_20.rds")
+
+cutoff <- ymd_hms("2020-01-01 00:00:00", tz="UTC")
 ```
 
-### Covariate: temperature
+
+
+### Covariate: Weather + Month dummy
 
 ```{r}
-temp_path <- "data/raw/ord_temp.txt"  
+weather_path <- "data/raw/ORD_weather.csv"  
 
-df_temp <- read.csv(
-  temp_path,
-  header = FALSE,
-  col.names = c("station", "timestamp", "temperature"),
-  stringsAsFactors = FALSE
-)
-df_temp <- df_temp %>% filter(station != "station")
-
-# Local Chicago timestamps are converted to UTC to match the load data.
-df_temp$timestamp <- as.POSIXct(
-  df_temp$timestamp,
-  format = "%Y-%m-%d %H:%M",
-  tz = "America/Chicago"
-)
-
-df_temp <- df_temp %>% mutate( timestamp_utc = with_tz(timestamp, "UTC") )
-
-range(df_temp$timestamp_utc)
-```
-
-```{r}
-library(readr)
-
-# Temperatures are converted to numeric and rounded to the nearest hour.
-df_temp2 <- df_temp %>%
+df_weather <- read.csv(weather_path, stringsAsFactors = FALSE) %>%
+  filter(valid != "valid") %>%
   mutate(
-    temperature = parse_number(temperature),  
-    ts_hour_utc = round_date(timestamp_utc, "hour")
+    timestamp = ymd_hm(valid, tz = "UTC"),
+    tmpf = parse_number(tmpf),
+    dwpf = parse_number(dwpf),
+    sped = parse_number(sped),
+    p01m = parse_number(p01m),
+    ts_hour_utc = round_date(timestamp, "hour")
   )
+head(df_weather,2)
+```
+- station: air monitoring station.
+- valid: utc timestamp as string
+- tmpf: air temperature [F]
+- dwpf: dew point [F], the temperature to which air must be cooled to become saturated with water vapor (
+ relative humidity)
+- sped: wind speed [mph]
+- p01m: 1 hour precipitation [mm]
 
-df_temp_hr <- df_temp2 %>%
+
+**tidy up the weaather df to be aligned with elec demand df**
+```{r}
+# round to hour
+df_weather_hr <- df_weather %>%
   group_by(ts_hour_utc) %>%
-  summarise(temp = mean(temperature, na.rm = TRUE), .groups = "drop") %>%
+  summarise(
+    across(c(tmpf, dwpf, sped, p01m),
+           ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
   arrange(ts_hour_utc)
 
 # A complete hourly UTC time grid
 full_hours <- tibble(
-  ts_hour_utc = seq(
-    min(df_temp_hr$ts_hour_utc),
-    max(df_temp_hr$ts_hour_utc),
-    by = "hour"
-  )
+  ts_hour_utc = seq(min(df_weather_hr$ts_hour_utc),
+                    max(df_weather_hr$ts_hour_utc),
+                    by = "hour")
 )
 
-df_temp_full <- full_hours %>% left_join(df_temp_hr, by = "ts_hour_utc")
+df_weather_full <- full_hours %>%
+  left_join(df_weather_hr, by = "ts_hour_utc")
 
-df_temp_full <- df_temp_full %>%
-  mutate(t_num = as.numeric(ts_hour_utc))
-
-
-# Missing temperatures are linearly interpolated.
-ok <- !is.na(df_temp_full$temp)
-
-df_temp_full$temp <- approx(
-  x = df_temp_full$t_num[ok],
-  y = df_temp_full$temp[ok],
-  xout = df_temp_full$t_num,
-  method = "linear",
-  rule = 2
-)$y
-
-df_temp_full <- df_temp_full %>%
-  select(ts_hour_utc, temp)
-```
-```{r fig.width=12, fig.height=4}
-ggplot(df_temp_full, aes(x = ts_hour_utc, y = temp)) +
-  geom_line(color = "steelblue") +
-  labs(
-    title = "Hourly Temperature (ORD)",
-    x = "Time (UTC)",
-    y = "Temperature (°F)"
-  ) +
-  theme_minimal()
+# Missing weather are linearly interpolated.
+df_weather_full <- df_weather_full %>%
+  arrange(ts_hour_utc) %>%
+  mutate(t = as.numeric(ts_hour_utc)) %>%
+  mutate(
+    across(
+      c(tmpf, dwpf, sped, p01m),
+      ~ approx(t[!is.na(.x)],
+               .x[!is.na(.x)],
+               t,
+               rule = 2)$y
+    )
+  ) %>%
+  select(-t)
 ```
 
+**Feature engineering on weather data**
+```{r}
+tmp_threshold <-60
+
+df_weather_full <- df_weather_full %>%
+  mutate(
+    # time
+    month = month(ts_hour_utc),
+    
+    # Heating Degree Hour & Cooling Degree Hour
+    HDH = pmax(tmp_threshold - tmpf, 0),
+    CDH = pmax(tmpf - tmp_threshold, 0),
+    
+    # season indicator
+    is_winter = ifelse(month %in% c(12,1,2,3), 1, 0),
+    is_summer = ifelse(month %in% c(6,7,8,9), 1, 0),
+    
+    # interaction
+    winter_HDH  = HDH * is_winter,
+    winter_wind = sped * is_winter,
+    summer_CDH  = CDH * is_summer,
+    summer_dew  = dwpf * is_summer
+  )
+```
+
+**month dummy**
+```{r}
+df_weather_full$month_f <- factor(df_weather_full$month,
+                                   levels = 1:12,
+                                   labels = month.abb)
+month_dummy <- model.matrix(~ month_f - 1, data = df_weather_full)
+
+# drop one to avoid multilinearity
+month_dummy <- month_dummy[, colnames(month_dummy) != "month_fJan", drop = FALSE]
+```
+
+**Final Xreg**
+
+```{r}
+df_xreg <- cbind(
+  df_weather_full %>%
+    select(ts_hour_utc, HDH, CDH, is_winter, is_summer, winter_HDH, winter_wind, summer_CDH, summer_dew) %>%
+    rename(timestamp = ts_hour_utc),
+  month_dummy
+) %>%
+  as.data.frame()
+
+df_xreg_1819 <- df_xreg %>% filter(timestamp < cutoff)
+df_xreg_20   <- df_xreg %>% filter(timestamp >= cutoff)
+```
 
 
 ## Train - Validation - Test
 
-### Prepare Train - test data
+### split train validation on 1819 data
 
-Use the time range of temperature to crop the time range of load (ensuring they are completely aligned)
 
 ```{r}
-### split train test 
-temp_start <- min(df_temp_full$ts_hour_utc)
-temp_end   <- max(df_temp_full$ts_hour_utc)
-# elec demand
-df_1819_cut <- df_1819 %>% filter(timestamp >= temp_start)
-df_20_cut <- df_20 %>% filter(timestamp <= temp_end)
-# temp
-cutoff <- ymd_hms("2020-01-01 00:00:00", tz = "UTC")
-temp_1819 <- df_temp_full %>% filter(ts_hour_utc >= temp_start, ts_hour_utc < cutoff)
-temp_20 <- df_temp_full %>% filter(ts_hour_utc >= cutoff, ts_hour_utc <= temp_end)
+H_val <- 24 * 7 * 2  # 2 weeks
 
+# 1) assure time sorting
+df_1819      <- df_1819 %>% arrange(timestamp)
+df_xreg_1819 <- df_xreg_1819 %>% arrange(timestamp)
 
-### split train - validation on "train df"
-# create aligned train dataframe
-train_xy <- df_1819_cut %>%
-  select(timestamp, y = electricity_demand) %>%
-  inner_join(temp_1819, by = c("timestamp" = "ts_hour_utc")) %>%
-  arrange(timestamp)
-# train - valid split
-H_val <- 56 * 24
-n <- nrow(train_xy)
-train_part <- train_xy[1:(n - H_val), ]
-valid_part <- train_xy[(n - H_val + 1):n, ]
-# Xreg
-center_temp = 45
-temp_center_train <- train_part$temp - center_temp
-X_train <- cbind(temp  = temp_center_train,temp2 = temp_center_train^2)
-temp_center_valid <- valid_part$temp - center_temp
-X_valid <- cbind(temp  = temp_center_valid,temp2 = temp_center_valid^2)
+# 2) Alignment check
+stopifnot(nrow(df_1819) == nrow(df_xreg_1819))
+stopifnot(all(df_1819$timestamp == df_xreg_1819$timestamp))
 
-# convert to expected input dtype
-y_train <- ts(train_part$y, frequency = 24)
-y_valid <- ts(valid_part$y, frequency = 24)
+# 3) train/val index
+n_1819 <- nrow(df_1819)
+idx_train <- 1:(n_1819 - H_val)
+idx_val   <- (n_1819 - H_val + 1):n_1819
+
+y_train <- df_1819[idx_train, ]
+y_val   <- df_1819[idx_val, ]
+
+df_xreg_train <- df_xreg_1819[idx_train, ]
+df_xreg_val   <- df_xreg_1819[idx_val, ]
 ```
 
+
+**SARIMAX input dtype：ts + xreg matrix**
+```{r}
+y_col <- "electricity_demand"  
+
+# ts: hourly, frequency=24 
+y_train_ts <- ts(y_train[[y_col]], frequency = 24)
+y_val_ts   <- ts(y_val[[y_col]],   frequency = 24)
+
+# xreg: drop timestamp, as.matrix
+xreg_train <- df_xreg_train %>% select(-timestamp) %>% as.matrix()
+xreg_val   <- df_xreg_val   %>% select(-timestamp) %>% as.matrix()
+
+stopifnot(length(y_train_ts) == nrow(xreg_train))
+stopifnot(length(y_val_ts)   == nrow(xreg_val))
+stopifnot(ncol(xreg_train)   == ncol(xreg_val))
+stopifnot(all(colnames(xreg_train) == colnames(xreg_val)))
+```
+
+
+**plot to show xreg**
 ```{r fig.width=12, fig.height=6}
-plot_df <- train_part %>%
-  mutate(
-    temp_center = temp - center_temp,
-    temp_sq     = temp_center^2
+library(tidyr)
+
+y_col <- "electricity_demand"
+
+plot_base <- df_1819 %>%
+  select(timestamp, all_of(y_col)) %>%
+  inner_join(
+    df_xreg_1819 %>%
+      select(timestamp, winter_HDH, winter_wind, summer_CDH, summer_dew),
+    by = "timestamp"
   ) %>%
-  select(timestamp, y, temp_center, temp_sq) %>%
-  tidyr::pivot_longer(
-    cols = c(y, temp_center, temp_sq),
+  arrange(timestamp)
+
+plot_df <- plot_base %>%
+  pivot_longer(
+    cols = -timestamp,
     names_to = "series",
     values_to = "value"
+  ) %>%
+  mutate(
+    series = factor(
+      series,
+      levels = c(
+        y_col,
+        "winter_HDH",
+        "winter_wind",
+        "summer_CDH",
+        "summer_dew"
+      )
+    )
   )
 
 ggplot(plot_df, aes(x = timestamp, y = value)) +
   geom_line() +
   facet_wrap(~series, ncol = 1, scales = "free_y") +
   theme_minimal() +
-  labs(title = "Train Data: Demand vs Centered Temperature Features",
-       x = NULL,
-       y = NULL)
+  labs(
+    title = "Electricity Demand and Weather Features",
+    x = NULL,
+    y = NULL
+  )
 ```
+**multicollinearity**
+
+```{r}
+library(usdm)
+vif(weather_vars)
+```
+
+safe to have all of four weather coraviates as xreg.
+
 
 
 ### Assumptions made for the modeling
 
-(S)ARIMAX models require future values of exogenous covariates when generating forecasts. In this application, temperature is used as an external regressor. Since reliable weather forecasts are available and generally highly accurate over short horizons, we assume that future temperature forecasts are equal to the realized temperature values. Therefore, temperature is treated as known when producing demand forecasts.
+(S)ARIMAX models require future values of exogenous covariates when generating forecasts. In this application, weather features such as temperature and precipitation are used as an external regressor. Since reliable weather forecasts are available and generally highly accurate over short horizons, we assume that future temperature forecasts are equal to the realized temperature values. Therefore, weather features are treated as known when producing demand forecasts.
 
-We assume the covriate can solve the heteroscedasticity issue.
+We assume the covariate can solve the heteroscedasticity issue.
 
-The temperature data is the record from station in Chicago, here we assume the weather condition in Chicago and Cook County are identical.
+The weather data is actually the records from ord station in Chicago, here we assume the weather condition in Chicago and Cook County are identical.
 
 ### Train - Validation
 
@@ -180,22 +258,26 @@ The temperature data is the record from station in Chicago, here we assume the w
 
 ```{r}
 # auto.arima -> ARIMA(1,1,0)(2,1,2)[24]
-fit_arima_quick <- auto.arima(
-  y_train,
-  xreg = X_train[, "temp2", drop = FALSE],
+weather_vars <- c("winter_HDH", "winter_wind", "summer_CDH", "summer_dew")
+Xreg_train_subset1 <- xreg_train[, weather_vars, drop = FALSE]
+
+fit_sarima_d1D1_1 <- auto.arima(
+  y_train_ts,
+  xreg = Xreg_train_subset1,
   seasonal = TRUE,
-  stepwise = FALSE,
+  stepwise = TRUE,
   approximation = TRUE,
   d = 1, D = 1,
   max.p = 4, max.q = 4,
   max.P = 3, max.Q = 3
 )
-summary(fit_arima_quick)
+
+summary(fit_sarima_d1D1_1)
 ```
 
+**Check Residuals**
 ```{r fig.width=12, fig.height=6}
-# Residual diagnostics
-res <- residuals(fit_arima_quick)
+res <- residuals(fit_sarima_d1D1)
 
 par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
 
@@ -233,7 +315,12 @@ abline(v = c(7,14,21,28), col = "red", lty = 3)
 
 #### Validation 1
 ```{r}
-fc <- forecast(fit_arima_quick, h = H_val, xreg = X_valid[, "temp2", drop = FALSE])
+fc_sarima_d1D1 <- forecast(fit_sarima_d1D1, h = H_val, xreg = X_valid[, "temp2", drop = FALSE])
+```
+
+
+```{r}
+fc <- fc_sarima_d1D1
 
 yhat_valid <- as.numeric(fc$mean)
 y_valid_vec <- as.numeric(y_valid)
@@ -251,77 +338,9 @@ valid_MAE
 valid_MAPE
 ```
 
-
-
-#### Try 2
-```{r}
-fit_sarimax <- Arima(y_train,
-  xreg = X_train[, "temp2", drop = FALSE],
-  order = c(4,0,3),
-  seasonal = list(order = c(2,1,1), period = 24),
-  method = "CSS-ML",
-  lambda = 0
-)
-summary(fit_sarimax)
-```
-
-```{r fig.width=12, fig.height=6}
-# Residual diagnostics
-res2 <- residuals(fit_sarimax)
-
-par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
-
-# (1) Residuals over time
-plot(train_part$timestamp, res2, type = "l",
-     main = "Residuals (Time Plot)", xlab = "Time", ylab = "Residual")
-abline(h = 0, lty = 2)
-
-# (2) Residual distribution
-hist(res2, breaks = 50, probability = TRUE,
-     main = "Residual Distribution", xlab = "Residual")
-lines(density(res2, na.rm = TRUE))
-
-# (3) ACF short (0–24 lags)
-acf(res2, lag.max = 24, na.action = na.pass, ylim = c(-0.2, 0.2))
-
-# (4) PACF short (0–24 lags)
-pacf(res2, lag.max = 24, na.action = na.pass)
-
-par(mfrow = c(1, 1))
-```
-```{r}
-par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
-
-# (5) ACF long  (0–4 weeks)
-acf(res2, lag.max = 24 * 7 * 4, na.action = na.pass, ylim = c(-0.2, 0.2))
-abline(v = c(7,14,21,28), col = "red", lty = 3)
-
-# (6) PACF long (0–4 weeks)
-pacf(res2, lag.max = 24 * 7 * 4, na.action = na.pass)
-abline(v = c(7,14,21,28), col = "red", lty = 3)
-
-```
-
-
-#### Validation 2
-
-```{r}
-fc2 <- forecast(fit_sarimax, h = H_val, xreg = X_valid[, "temp2", drop = FALSE])
-
-yhat_valid2 <- as.numeric(fc2$mean)
-y_valid_vec <- as.numeric(y_valid)
-
-valid_RMSE <- rmse(y_valid_vec, yhat_valid2)
-valid_MAE  <- mae(y_valid_vec, yhat_valid2)
-valid_MAPE <- mape(y_valid_vec, yhat_valid2)
-
-valid_RMSE
-valid_MAE
-valid_MAPE
-```
-```{r fig.width=12, fig.height=6}
-yhat_valid_plot <- yhat_valid2
-fc_plot <-fc2
+```{r fig.width=12, fig.height=4}
+fc_plot <- fc_sarima_d1D1
+yhat_valid_plot <- fc_plot$mean
 
 # --- 1. train actual ---
 train_df <- data.frame(
@@ -374,10 +393,153 @@ ggplot() +
   theme_minimal() +
   labs(title = "Train + Validation Forecast",
        x = "Time",
-       y = "Electricity Demand")
+       y = "Electricity Demand")+
+  coord_cartesian(
+    xlim = c(
+      min(valid_part$timestamp) - days(7*12),
+      max(valid_part$timestamp)
+    )
+  )
+```
 
-coord_cartesian(xlim = c(min(valid_part$timestamp) - days(24*7*4*6),
-                         max(valid_part$timestamp)))
+#### Try 2
+```{r}
+fit_sarimax_D1 <- Arima(y_train,
+  xreg = X_train[, "temp2", drop = FALSE],
+  order = c(4,0,3),
+  seasonal = list(order = c(2,1,1), period = 24),
+  method = "CSS-ML",
+  lambda = 0
+)
+
+summary(fit_sarimax_D1)
+```
+
+**Check Residuals**
+```{r fig.width=12, fig.height=6}
+res <- residuals(fit_sarimax_D1)
+
+par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
+
+# (1) Residuals over time
+plot(train_part$timestamp, res, type = "l",
+     main = "Residuals (Time Plot)", xlab = "Time", ylab = "Residual")
+abline(h = 0, lty = 2)
+
+# (2) Residual distribution
+hist(res, breaks = 50, probability = TRUE,
+     main = "Residual Distribution", xlab = "Residual")
+lines(density(res, na.rm = TRUE))
+
+# (3) ACF short (0–24 lags)
+acf(res, lag.max = 24, na.action = na.pass, ylim = c(-0.2, 0.2))
+
+# (4) PACF short (0–24 lags)
+pacf(res, lag.max = 24, na.action = na.pass)
+
+par(mfrow = c(1, 1))
+```
+```{r}
+par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
+
+# (5) ACF long  (0–4 weeks)
+acf(res, lag.max = 24 * 7 * 4, na.action = na.pass, ylim = c(-0.2, 0.2))
+abline(v = c(7,14,21,28), col = "red", lty = 3)
+
+# (6) PACF long (0–4 weeks)
+pacf(res, lag.max = 24 * 7 * 4, na.action = na.pass)
+abline(v = c(7,14,21,28), col = "red", lty = 3)
+
+```
+
+
+#### Validation 2
+```{r}
+fc_sarima_D1 <- forecast(fit_sarima_D1, h = H_val, xreg = X_valid[, "temp2", drop = FALSE])
+```
+
+
+```{r}
+fc <- fc_sarima_D1
+
+yhat_valid <- as.numeric(fc$mean)
+y_valid_vec <- as.numeric(y_valid)
+
+rmse <- function(a, f) sqrt(mean((a - f)^2, na.rm = TRUE))
+mae  <- function(a, f) mean(abs(a - f), na.rm = TRUE)
+mape <- function(a, f) mean(abs((a - f) / a), na.rm = TRUE) * 100
+
+valid_RMSE <- rmse(y_valid_vec, yhat_valid)
+valid_MAE  <- mae(y_valid_vec, yhat_valid)
+valid_MAPE <- mape(y_valid_vec, yhat_valid)
+
+valid_RMSE
+valid_MAE
+valid_MAPE
+```
+
+```{r fig.width=12, fig.height=4}
+fc_plot <- fc_sarima_D1
+yhat_valid_plot <- fc_plot$mean
+
+# --- 1. train actual ---
+train_df <- data.frame(
+  timestamp = train_part$timestamp,
+  value     = as.numeric(y_train),
+  type      = "Train"
+)
+
+# --- 2. validation actual ---
+valid_df <- data.frame(
+  timestamp = valid_part$timestamp,
+  value     = y_valid_vec,
+  type      = "Validation"
+)
+
+# --- 3. forecast ---
+forecast_df <- data.frame(
+  timestamp = valid_part$timestamp,
+  Forecast  = yhat_valid_plot,
+  Lower     = fc_plot$lower[,2],
+  Upper     = fc_plot$upper[,2]
+)
+
+# --- 4. plot ---
+ggplot() +
+  # Train actual
+  geom_line(data = train_df,
+            aes(x = timestamp, y = value),
+            color = "black", linewidth = 0.6) +
+  
+  # Validation actual
+  geom_line(data = valid_df,
+            aes(x = timestamp, y = value),
+            color = "black", linewidth = 0.6) +
+  
+  # Forecast CI
+  geom_ribbon(data = forecast_df,
+              aes(x = timestamp, ymin = Lower, ymax = Upper),
+              fill = "pink", alpha = 0.3) +
+  
+  # Forecast line
+  geom_line(data = forecast_df,
+            aes(x = timestamp, y = Forecast),
+            color = "red", linewidth = 0.7) +
+  
+  # vertical split line
+  geom_vline(xintercept = min(valid_part$timestamp),
+             linetype = "dashed", color = "blue") +
+  
+  theme_minimal() +
+  labs(title = "Train + Validation Forecast",
+       x = "Time",
+       y = "Electricity Demand")+
+  coord_cartesian(
+    xlim = c(
+      min(valid_part$timestamp) - days(7*12),
+      max(valid_part$timestamp)
+    )
+  )
 ```
 
 
@@ -386,14 +548,12 @@ coord_cartesian(xlim = c(min(valid_part$timestamp) - days(24*7*4*6),
 #### Train the model on whole training data
 
 ```{r}
-# creat xreg
-temp_center_full <- (temp_1819$temp - 40)^2
-X_full <- cbind(temp2 = temp_center_full)
+Xreg_full <- df_xreg_1819 %>% select(-timestamp) %>% as.matrix()
 
 y_full <- ts(df_1819_cut$electricity_demand, frequency = 24)
 
 final_fit_sarimax <- auto.arima(y_full,
-  xreg = X_full,
+  xreg = Xreg_full,
   order = c(4,0,3),
   seasonal = list(order = c(2,1,1), period = 24),
   method = "CSS-ML",
@@ -403,20 +563,21 @@ final_fit_sarimax <- auto.arima(y_full,
 
 #### Forecast on test
 ```{r}
-temp_center_test <- (temp_20$temp - 40)^2
-X_test <- cbind(temp2 = temp_center_test)
+# forecast horizon
+h_fc <- 24*7*4
 
-h_fc <- nrow(df_20_cut)
+Xreg_test <- df_xreg_20 %>%
+  slice(seq_len(h_fc)) %>%
+  select(-timestamp) %>%
+  as.data.frame()
 
-fc_test <- forecast(
-  final_fit_sarimax,
-  h = h_fc,
-  xreg = X_test
-)
+Xreg_test <- Xreg_test[, colnames(Xreg_full), drop = FALSE] %>% as.matrix()
+
+fc_test <- forecast(final_fit_sarimax, h = h_fc, xreg = Xreg_test)
 
 y_pred <- as.numeric(fc_test$mean)
 forecast_df_test <- data.frame(
-  timestamp = df_20_cut$timestamp,
+  timestamp = df_20_cut$timestamp[seq_len(h_fc)],
   Forecast  = y_pred,
   Lower     = fc_test$lower[,2],  # 95%
   Upper     = fc_test$upper[,2]
