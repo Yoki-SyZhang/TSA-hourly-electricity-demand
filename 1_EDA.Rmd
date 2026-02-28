@@ -212,6 +212,8 @@ mstl_decomp_1819 <- mstl(ts_1819)
 plot(mstl_decomp_1819)
 ```
 
+seasonality = 24 has bigger amplitude, so seasonality = 24 is prefered for our case.
+
 ##### Check Residuals from STL Decomposition
 
 ```{r fig.width=12, fig.height=8}
