@@ -191,12 +191,18 @@ h_fc   <- nrow(df_20)
 ts_out <- df_20$timestamp
 
 fit_ets <- ets(ts_1819)
-fc_ets  <- forecast(fit_ets, h = h_fc)
+fc_test  <- forecast(fit_ets, h = h_fc)
 y_pred  <- as.numeric(fc_ets$mean)
 
-test_forecast <- tibble(
+forecast_df_test <- data.frame(
   timestamp = ts_out,
-  y_pred    = y_pred
+  Forecast  = y_pred,
+  Lower     = fc_test$lower[,2],  # 95%
+  Upper     = fc_test$upper[,2]
 )
-write.csv(test_forecast, forecast_path, row.names = FALSE)
+write.csv(
+  forecast_df_test,
+  forecast_path,
+  row.names = FALSE
+)
 ```
