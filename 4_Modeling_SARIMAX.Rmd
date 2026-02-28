@@ -254,6 +254,128 @@ The weather data is actually the records from ord station in Chicago, here we as
 
 ### Train - Validation
 
+
+#### Create func for validation
+
+```{r}
+plot_residual_diag <- function(fit, timestamp) {
+  res <- residuals(fit)
+  par(mfrow = c(2,2), mar = c(4,4,2,1))
+  plot(timestamp, res, type="l"); abline(h=0,lty=2)
+  hist(res, breaks=50, prob=TRUE); lines(density(res, na.rm=TRUE))
+  acf(res, lag.max=24, na.action=na.pass)
+  pacf(res, lag.max=24, na.action=na.pass)
+  par(mfrow=c(1,1))
+}
+
+plot_residual_acf_longlag <- function(fit) {
+  res <- residuals(fit)
+  par(mfrow=c(2,1), mar=c(4,4,2,1))
+  acf(res, lag.max=24*7*4, na.action=na.pass, ylim=c(-0.2,0.2))
+  abline(v=c(7,14,21,28), col="red", lty=3)
+  pacf(res, lag.max=24*7*4, na.action=na.pass)
+  abline(v=c(7,14,21,28), col="red", lty=3)
+  par(mfrow=c(1,1))
+}
+```
+
+
+```{r}
+calc_metrics <- function(actual, forecast_mean) {
+  actual <- as.numeric(actual)
+  forecast_mean <- as.numeric(forecast_mean)
+  
+  c(
+    RMSE = sqrt(mean((actual - forecast_mean)^2)),
+    MAE  = mean(abs(actual - forecast_mean)),
+    MAPE = mean(abs((actual - forecast_mean) / actual)) * 100
+  )
+}
+
+plot_train_valid_forecast <- function(
+  y_train,           # data.frame, must contain timestamp
+  y_train_ts,        # ts or numeric (train actual values)
+  y_val,             # data.frame, must contain timestamp
+  y_valid_vec,       # numeric (validation actual values)
+  fc_obj,            # forecast object from forecast()
+  ci_level = 2,      # which column of lower/upper to use (e.g., 2 for 95%)
+  lookback_days = 7*12  # how many days before split to show
+) {
+  # --- forecast vector ---
+  yhat_valid <- as.numeric(fc_obj$mean)
+
+  # --- align length (safety) ---
+  h <- length(yhat_valid)
+
+  # timestamps for validation/forecast must be length h
+  ts_val <- y_val$timestamp[seq_len(h)]
+
+  # --- 1. train actual ---
+  train_df <- data.frame(
+    timestamp = y_train$timestamp,
+    value     = as.numeric(y_train_ts),
+    type      = "Train"
+  )
+
+  # --- 2. validation actual (aligned) ---
+  valid_df <- data.frame(
+    timestamp = ts_val,
+    value     = y_valid_vec[seq_len(h)],
+    type      = "Validation"
+  )
+
+  # --- 3. forecast df (aligned) ---
+  forecast_df <- data.frame(
+    timestamp = ts_val,
+    Forecast  = yhat_valid,
+    Lower     = fc_obj$lower[seq_len(h), ci_level],
+    Upper     = fc_obj$upper[seq_len(h), ci_level]
+  )
+
+  split_time <- min(ts_val)
+
+  # --- 4. plot ---
+  ggplot2::ggplot() +
+    ggplot2::geom_line(
+      data = train_df,
+      ggplot2::aes(x = timestamp, y = value),
+      color = "black", linewidth = 0.6
+    ) +
+    ggplot2::geom_line(
+      data = valid_df,
+      ggplot2::aes(x = timestamp, y = value),
+      color = "black", linewidth = 0.6
+    ) +
+    ggplot2::geom_ribbon(
+      data = forecast_df,
+      ggplot2::aes(x = timestamp, ymin = Lower, ymax = Upper),
+      fill = "pink", alpha = 0.3
+    ) +
+    ggplot2::geom_line(
+      data = forecast_df,
+      ggplot2::aes(x = timestamp, y = Forecast),
+      color = "red", linewidth = 0.7
+    ) +
+    ggplot2::geom_vline(
+      xintercept = split_time,
+      linetype = "dashed", color = "blue"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = "Train + Validation Forecast",
+      x = "Time",
+      y = "Electricity Demand"
+    ) +
+    ggplot2::coord_cartesian(
+      xlim = c(
+        split_time - lubridate::days(lookback_days),
+        max(ts_val)
+      )
+    )
+}
+```
+
+
 #### Try 1
 
 ```{r}
@@ -277,129 +399,40 @@ summary(fit_sarima_d1D1_1)
 
 **Check Residuals**
 ```{r fig.width=12, fig.height=6}
-res <- residuals(fit_sarima_d1D1)
-
-par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
-
-# (1) Residuals over time
-plot(train_part$timestamp, res, type = "l",
-     main = "Residuals (Time Plot)", xlab = "Time", ylab = "Residual")
-abline(h = 0, lty = 2)
-
-# (2) Residual distribution
-hist(res, breaks = 50, probability = TRUE,
-     main = "Residual Distribution", xlab = "Residual")
-lines(density(res, na.rm = TRUE))
-
-# (3) ACF short (0–24 lags)
-acf(res, lag.max = 24, na.action = na.pass, ylim = c(-0.2, 0.2))
-
-# (4) PACF short (0–24 lags)
-pacf(res, lag.max = 24, na.action = na.pass)
-
-par(mfrow = c(1, 1))
+plot_residual_diag(fit_sarima_d1D1_1, y_train$timestamp)
 ```
 ```{r}
-par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
-
-# (5) ACF long  (0–4 weeks)
-acf(res, lag.max = 24 * 7 * 4, na.action = na.pass, ylim = c(-0.2, 0.2))
-abline(v = c(7,14,21,28), col = "red", lty = 3)
-
-# (6) PACF long (0–4 weeks)
-pacf(res, lag.max = 24 * 7 * 4, na.action = na.pass)
-abline(v = c(7,14,21,28), col = "red", lty = 3)
-
+plot_residual_acf_longlag(fit_sarima_d1D1_1)
 ```
 
 
-#### Validation 1
+**Validation**
 ```{r}
-fc_sarima_d1D1 <- forecast(fit_sarima_d1D1, h = H_val, xreg = X_valid[, "temp2", drop = FALSE])
+weather_vars <- weather_vars
+xreg_val_subset <- xreg_val[, weather_vars, drop = FALSE]
+
+fc_sarima_d1D1_1 <- forecast(fit_sarima_d1D1_1, h = H_val, xreg = xreg_val_subset)
 ```
 
 
 ```{r}
-fc <- fc_sarima_d1D1
 
-yhat_valid <- as.numeric(fc$mean)
-y_valid_vec <- as.numeric(y_valid)
 
-rmse <- function(a, f) sqrt(mean((a - f)^2, na.rm = TRUE))
-mae  <- function(a, f) mean(abs(a - f), na.rm = TRUE)
-mape <- function(a, f) mean(abs((a - f) / a), na.rm = TRUE) * 100
-
-valid_RMSE <- rmse(y_valid_vec, yhat_valid)
-valid_MAE  <- mae(y_valid_vec, yhat_valid)
-valid_MAPE <- mape(y_valid_vec, yhat_valid)
-
-valid_RMSE
-valid_MAE
-valid_MAPE
+calc_metrics(y_val_ts, fc_sarima_d1D1_1$mean)
 ```
 
 ```{r fig.width=12, fig.height=4}
-fc_plot <- fc_sarima_d1D1
-yhat_valid_plot <- fc_plot$mean
 
-# --- 1. train actual ---
-train_df <- data.frame(
-  timestamp = train_part$timestamp,
-  value     = as.numeric(y_train),
-  type      = "Train"
+
+plot_train_valid_forecast(
+  y_train = y_train,
+  y_train_ts = y_train_ts,
+  y_val = y_val,
+  y_valid_vec = y_valid_vec,
+  fc_obj = fc_sarima_d1D1_1,
+  ci_level = 2,
+  lookback_days = 7*12
 )
-
-# --- 2. validation actual ---
-valid_df <- data.frame(
-  timestamp = valid_part$timestamp,
-  value     = y_valid_vec,
-  type      = "Validation"
-)
-
-# --- 3. forecast ---
-forecast_df <- data.frame(
-  timestamp = valid_part$timestamp,
-  Forecast  = yhat_valid_plot,
-  Lower     = fc_plot$lower[,2],
-  Upper     = fc_plot$upper[,2]
-)
-
-# --- 4. plot ---
-ggplot() +
-  # Train actual
-  geom_line(data = train_df,
-            aes(x = timestamp, y = value),
-            color = "black", linewidth = 0.6) +
-  
-  # Validation actual
-  geom_line(data = valid_df,
-            aes(x = timestamp, y = value),
-            color = "black", linewidth = 0.6) +
-  
-  # Forecast CI
-  geom_ribbon(data = forecast_df,
-              aes(x = timestamp, ymin = Lower, ymax = Upper),
-              fill = "pink", alpha = 0.3) +
-  
-  # Forecast line
-  geom_line(data = forecast_df,
-            aes(x = timestamp, y = Forecast),
-            color = "red", linewidth = 0.7) +
-  
-  # vertical split line
-  geom_vline(xintercept = min(valid_part$timestamp),
-             linetype = "dashed", color = "blue") +
-  
-  theme_minimal() +
-  labs(title = "Train + Validation Forecast",
-       x = "Time",
-       y = "Electricity Demand")+
-  coord_cartesian(
-    xlim = c(
-      min(valid_part$timestamp) - days(7*12),
-      max(valid_part$timestamp)
-    )
-  )
 ```
 
 #### Try 2
@@ -414,134 +447,6 @@ fit_sarimax_D1 <- Arima(y_train,
 
 summary(fit_sarimax_D1)
 ```
-
-**Check Residuals**
-```{r fig.width=12, fig.height=6}
-res <- residuals(fit_sarimax_D1)
-
-par(mfrow = c(2, 2), mar = c(4, 4, 2, 1))
-
-# (1) Residuals over time
-plot(train_part$timestamp, res, type = "l",
-     main = "Residuals (Time Plot)", xlab = "Time", ylab = "Residual")
-abline(h = 0, lty = 2)
-
-# (2) Residual distribution
-hist(res, breaks = 50, probability = TRUE,
-     main = "Residual Distribution", xlab = "Residual")
-lines(density(res, na.rm = TRUE))
-
-# (3) ACF short (0–24 lags)
-acf(res, lag.max = 24, na.action = na.pass, ylim = c(-0.2, 0.2))
-
-# (4) PACF short (0–24 lags)
-pacf(res, lag.max = 24, na.action = na.pass)
-
-par(mfrow = c(1, 1))
-```
-```{r}
-par(mfrow = c(2, 1), mar = c(4, 4, 2, 1))
-
-# (5) ACF long  (0–4 weeks)
-acf(res, lag.max = 24 * 7 * 4, na.action = na.pass, ylim = c(-0.2, 0.2))
-abline(v = c(7,14,21,28), col = "red", lty = 3)
-
-# (6) PACF long (0–4 weeks)
-pacf(res, lag.max = 24 * 7 * 4, na.action = na.pass)
-abline(v = c(7,14,21,28), col = "red", lty = 3)
-
-```
-
-
-#### Validation 2
-```{r}
-fc_sarima_D1 <- forecast(fit_sarima_D1, h = H_val, xreg = X_valid[, "temp2", drop = FALSE])
-```
-
-
-```{r}
-fc <- fc_sarima_D1
-
-yhat_valid <- as.numeric(fc$mean)
-y_valid_vec <- as.numeric(y_valid)
-
-rmse <- function(a, f) sqrt(mean((a - f)^2, na.rm = TRUE))
-mae  <- function(a, f) mean(abs(a - f), na.rm = TRUE)
-mape <- function(a, f) mean(abs((a - f) / a), na.rm = TRUE) * 100
-
-valid_RMSE <- rmse(y_valid_vec, yhat_valid)
-valid_MAE  <- mae(y_valid_vec, yhat_valid)
-valid_MAPE <- mape(y_valid_vec, yhat_valid)
-
-valid_RMSE
-valid_MAE
-valid_MAPE
-```
-
-```{r fig.width=12, fig.height=4}
-fc_plot <- fc_sarima_D1
-yhat_valid_plot <- fc_plot$mean
-
-# --- 1. train actual ---
-train_df <- data.frame(
-  timestamp = train_part$timestamp,
-  value     = as.numeric(y_train),
-  type      = "Train"
-)
-
-# --- 2. validation actual ---
-valid_df <- data.frame(
-  timestamp = valid_part$timestamp,
-  value     = y_valid_vec,
-  type      = "Validation"
-)
-
-# --- 3. forecast ---
-forecast_df <- data.frame(
-  timestamp = valid_part$timestamp,
-  Forecast  = yhat_valid_plot,
-  Lower     = fc_plot$lower[,2],
-  Upper     = fc_plot$upper[,2]
-)
-
-# --- 4. plot ---
-ggplot() +
-  # Train actual
-  geom_line(data = train_df,
-            aes(x = timestamp, y = value),
-            color = "black", linewidth = 0.6) +
-  
-  # Validation actual
-  geom_line(data = valid_df,
-            aes(x = timestamp, y = value),
-            color = "black", linewidth = 0.6) +
-  
-  # Forecast CI
-  geom_ribbon(data = forecast_df,
-              aes(x = timestamp, ymin = Lower, ymax = Upper),
-              fill = "pink", alpha = 0.3) +
-  
-  # Forecast line
-  geom_line(data = forecast_df,
-            aes(x = timestamp, y = Forecast),
-            color = "red", linewidth = 0.7) +
-  
-  # vertical split line
-  geom_vline(xintercept = min(valid_part$timestamp),
-             linetype = "dashed", color = "blue") +
-  
-  theme_minimal() +
-  labs(title = "Train + Validation Forecast",
-       x = "Time",
-       y = "Electricity Demand")+
-  coord_cartesian(
-    xlim = c(
-      min(valid_part$timestamp) - days(7*12),
-      max(valid_part$timestamp)
-    )
-  )
-```
-
 
 ### Forecast output on Test Data
 
