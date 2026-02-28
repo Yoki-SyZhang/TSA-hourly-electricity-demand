@@ -1,0 +1,126 @@
+---
+title: "Cook County Electricity Demand Time Series Modeling - Simple Methods"
+output: html_document
+---
+
+# Load libraries
+
+```{r,warning=F,message=F}
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(dplyr)
+
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+```
+
+# Load Data
+
+```{r}
+df_1819 <- readRDS("df_1819.rds")
+df_2020   <- readRDS("df_20.rds")
+```
+
+```{r}
+ts_1819 <- ts(df_1819$electricity_demand, frequency = 24)
+ts_2020 <- ts(df_2020$electricity_demand,
+              start = end(ts_1819) + c(0, 1),
+              frequency = 24)
+
+h_fc <- length(ts_2020)
+level_ci <- 95
+
+dir.create("data/test_forecast", recursive = TRUE, showWarnings = FALSE)
+```
+
+# Modeling
+
+### Simple Methods (Baselines)
+
+```{r}
+fc_snaive <- snaive(ts_1819, h = h_fc, level = level_ci)
+fc_naive  <- naive(ts_1819,  h = h_fc, level = level_ci)
+fc_mean   <- meanf(ts_1819,  h = h_fc, level = level_ci)
+fc_drift  <- rwf(ts_1819,    h = h_fc, drift = TRUE, level = level_ci)
+
+acc_snaive <- accuracy(fc_snaive, ts_2020)
+acc_naive  <- accuracy(fc_naive,  ts_2020)
+acc_mean   <- accuracy(fc_mean,   ts_2020)
+acc_drift  <- accuracy(fc_drift,  ts_2020)
+
+baseline_summary <- rbind(
+  SNAIVE = acc_snaive["Test set", c("MAE","RMSE","MAPE")],
+  NAIVE  = acc_naive ["Test set", c("MAE","RMSE","MAPE")],
+  MEANF  = acc_mean  ["Test set", c("MAE","RMSE","MAPE")],
+  DRIFT  = acc_drift ["Test set", c("MAE","RMSE","MAPE")]
+)
+
+baseline_summary
+```
+
+```{r}
+autoplot(fc_snaive) + autolayer(ts_2020, series = "Actual") +
+  labs(title = "Seasonal Naive: Forecast with 95% Interval", x = "Time", y = "Electricity Demand")
+
+autoplot(fc_naive) + autolayer(ts_2020, series = "Actual") +
+  labs(title = "Naive: Forecast with 95% Interval", x = "Time", y = "Electricity Demand")
+
+autoplot(fc_mean) + autolayer(ts_2020, series = "Actual") +
+  labs(title = "Mean: Forecast with 95% Interval", x = "Time", y = "Electricity Demand")
+
+autoplot(fc_drift) + autolayer(ts_2020, series = "Actual") +
+  labs(title = "Drift: Forecast with 95% Interval", x = "Time", y = "Electricity Demand")
+```
+### Lightweight models
+```{r}
+fc_stlf <- stlf(ts_1819, method = "naive", h = h_fc, level = level_ci)
+acc_stlf <- accuracy(fc_stlf, ts_2020)
+acc_stlf["Test set", c("MAE","RMSE","MAPE")]
+```
+```{r}
+autoplot(fc_stlf) + autolayer(ts_2020, series = "Actual") +
+  labs(title = "STLF (naive): Forecast with 95% Interval", x = "Time", y = "Electricity Demand")
+```
+```{r}
+fit_tslm <- tslm(ts_1819 ~ trend + season)
+fc_tslm  <- forecast(fit_tslm, h = h_fc, level = level_ci)
+
+acc_tslm <- accuracy(fc_tslm, ts_2020)
+acc_tslm["Test set", c("MAE","RMSE","MAPE")]
+```
+```{r}
+library(lmtest)
+checkresiduals(fit_tslm)
+dwtest(fit_tslm)
+bgtest(fit_tslm, order = 24)
+```
+```{r}
+train_tail <- window(ts_1819, start = time(ts_1819)[length(ts_1819) - 336])
+autoplot(train_tail) +
+  autolayer(fc_tslm$mean, series = "Forecast") +
+  labs(title = "TSLM: Last 14 Days of Training and Test Forecast", x = "Time", y = "Electricity Demand")
+```
+
+### Export forecasts 
+
+```{r export_forecasts}
+get_95 <- function(x) if (is.matrix(x)) x[, ncol(x)] else x
+
+export_forecast_csv <- function(fc_obj, method_name){
+  out <- data.frame(
+    timestamp = df_2020$timestamp,
+    Forecast  = as.numeric(fc_obj$mean),
+    Lower     = as.numeric(get_95(fc_obj$lower)),
+    Upper     = as.numeric(get_95(fc_obj$upper))
+  )
+  write.csv(out, paste0("data/test_forecast/", method_name, "_20Jan.csv"), row.names = FALSE)
+  out
+}
+
+export_forecast_csv(fc_snaive, "SNAIVE")
+export_forecast_csv(fc_naive,  "NAIVE")
+export_forecast_csv(fc_mean,   "MEANF")
+export_forecast_csv(fc_drift,  "DRIFT")
+export_forecast_csv(fc_stlf,   "STLF")
+export_forecast_csv(fc_tslm,   "TSLM")
+```
