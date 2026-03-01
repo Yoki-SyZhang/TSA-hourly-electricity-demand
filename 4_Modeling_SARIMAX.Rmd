@@ -400,6 +400,17 @@ fit_sarimax_D1_1 <- Arima(
 summary(fit_sarimax_D1_1)
 ```
 
+**Check Residuals**
+```{r fig.width=12, fig.height=6}
+plot_residual_diag(fit_sarimax_D1_2, y_train$timestamp)
+```
+```{r}
+plot_residual_acf_longlag(fit_sarimax_D1_2)
+```
+
+Obiviously that, acf and pacf all have significant weekly lags, indicating that seasonality = 168 should be considered. 
+
+This shows the limitation of SARIMAX can only have one seasonality.
 
 
 **Validation**
@@ -457,28 +468,16 @@ summary(fit_lm)
 weather_vars_subset2 <- c("winter_HDH","CDH2", "p01m")
 Xreg_input <- xreg_train[, weather_vars_subset2, drop = FALSE]
 
-fit_sarimax_D1_2 <- auto.arima(
+fit_sarimax_D1_2 <- Arima(
   y_train_ts,
   xreg = Xreg_input,
-  seasonal = TRUE,
-  stepwise = TRUE,
-  approximation = TRUE,
-  d = 0, D = 1,
-  max.p = 4, max.q = 4,
-  max.P = 4, max.Q = 4
+  order = c(4,0,3),
+  seasonal = list(order = c(2,1,1), period = 24),
+  method = "CSS-ML",
 )
 
 summary(fit_sarimax_D1_2)
 ```
-
-**Check Residuals**
-```{r fig.width=12, fig.height=6}
-plot_residual_diag(fit_sarimax_D1_2, y_train$timestamp)
-```
-```{r}
-plot_residual_acf_longlag(fit_sarimax_D1_2)
-```
-
 
 **Validation**
 ```{r}
@@ -493,34 +492,58 @@ fc_sarima_D1_2 <- forecast(fit_sarimax_D1_2, h = H_val, xreg = xreg_val_subset)
 calc_metrics(y_val_ts, fc_sarima_D1_2$mean)
 ```
 
-```{r fig.width=12, fig.height=4}
-plot_train_valid_forecast(
-  y_train = y_train,
-  y_train_ts = y_train_ts,
-  y_val = y_val,
-  y_val_ts = y_val_ts,
-  fc_obj = fc_sarima_D1_2,
-  ci_level = 2,
-  lookback_days = 7*12
+
+#### Try 3
+
+```{r}
+weather_vars_subset3 <- c("tmpf2", "p01m")
+Xreg_input <- xreg_train[, weather_vars_subset3, drop = FALSE]
+
+fit_sarimax_D1_3 <- auto.arima(
+  y_train_ts,
+  xreg = Xreg_input,
+  seasonal = TRUE,
+  stepwise = TRUE,
+  approximation = TRUE,
+  d = 0, D = 1,
+  max.p = 4, max.q = 4,
+  max.P = 4, max.Q = 4
 )
+
+summary(fit_sarimax_D1_3)
+```
+
+
+**Validation**
+```{r}
+weather_vars <- weather_vars_subset3
+
+xreg_val_subset <- xreg_val[, weather_vars, drop = FALSE]
+fc_sarima_D1_3 <- forecast(fit_sarimax_D1_3, h = H_val, xreg = xreg_val_subset)
+```
+
+
+```{r}
+calc_metrics(y_val_ts, fc_sarima_D1_3$mean)
 ```
 
 
 ### Forecast output on Test Data
 
+Try 1 has the best validation result. So xreg will be c("tmpf2"), order will be "order = c(4,0,3), seasonal = list(order = c(2,1,1), period = 24)"
+
 #### Train the model on whole training data
 
 ```{r}
-Xreg_full <- df_xreg_1819 %>% select(-timestamp) %>% as.matrix()
+Xreg_full <- df_xreg_1819 %>% select(tmpf2) %>% as.matrix()
 
-y_full <- ts(df_1819_cut$electricity_demand, frequency = 24)
+y_full <- ts(df_1819$electricity_demand, frequency = 24)
 
-final_fit_sarimax <- auto.arima(y_full,
+final_fit_sarimax <- Arima(y_full,
   xreg = Xreg_full,
   order = c(4,0,3),
   seasonal = list(order = c(2,1,1), period = 24),
-  method = "CSS-ML",
-  lambda = 0
+  method = "ML"
 )
 ```
 
@@ -540,7 +563,7 @@ fc_test <- forecast(final_fit_sarimax, h = h_fc, xreg = Xreg_test)
 
 y_pred <- as.numeric(fc_test$mean)
 forecast_df_test <- data.frame(
-  timestamp = df_20_cut$timestamp[seq_len(h_fc)],
+  timestamp = df_20$timestamp[seq_len(h_fc)],
   Forecast  = y_pred,
   Lower     = fc_test$lower[,2],  # 95%
   Upper     = fc_test$upper[,2]
