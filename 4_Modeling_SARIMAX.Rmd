@@ -439,7 +439,7 @@ weather_vars_subset2 <- c("winter_HDH", "winter_wind", "CDH2", "p01m")
 lm_df <- y_train %>%
   select(timestamp, y = all_of(y_col)) %>%
   left_join(
-    df_xreg_train %>% select(timestamp, all_of(weather_vars_subset1)),
+    df_xreg_train %>% select(timestamp, all_of(weather_vars_subset2)),
     by = "timestamp"
   )
 
@@ -457,13 +457,15 @@ summary(fit_lm_log)
 weather_vars_subset2 <- c("winter_HDH","CDH2", "p01m")
 Xreg_input <- xreg_train[, weather_vars_subset2, drop = FALSE]
 
-fit_sarimax_D1_2 <- Arima(
+fit_sarimax_D1_2 <- auto.arima(
   y_train_ts,
   xreg = Xreg_input,
-  order = c(4,0,3),
-  seasonal = list(order = c(2,1,1), period = 24),
-  method = "CSS-ML",
-  lambda = 0
+  seasonal = TRUE,
+  stepwise = TRUE,
+  approximation = TRUE,
+  d = 0, D = 1,
+  max.p = 4, max.q = 4,
+  max.P = 4, max.Q = 4
 )
 
 summary(fit_sarimax_D1_2)
