@@ -1,5 +1,5 @@
 ---
-title: "Cook County Electricity Demand Time Series Modeling Handbook"
+title: "Cook County Electricity Demand Time Series Modeling Handbook - ETS as sample"
 output: html_document
 ---
 
