@@ -1,5 +1,5 @@
 ---
-title: "Cook County Electricity Demand Time Series Modeling - Simple Methods"
+title: "Cook County Electricity Demand Time Series Modeling - TBATS"
 output: html_document
 ---
 

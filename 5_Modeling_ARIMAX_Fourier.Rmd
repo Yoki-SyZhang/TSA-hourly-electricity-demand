@@ -1,5 +1,5 @@
 ---
-title: "Cook County Electricity Demand Time Series Modeling - SARIMAX"
+title: "Cook County Electricity Demand Time Series Modeling - SARIMAX+Fourier"
 output: html_document
 ---
 
