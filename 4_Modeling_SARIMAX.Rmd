@@ -91,7 +91,7 @@ df_weather_full <- df_weather_full %>%
 
 **Feature engineering on weather data**
 ```{r}
-tmp_threshold <-60
+tmp_threshold <-50
 
 df_weather_full <- df_weather_full %>%
   mutate(
@@ -99,8 +99,11 @@ df_weather_full <- df_weather_full %>%
     month = month(ts_hour_utc),
     
     # Heating Degree Hour & Cooling Degree Hour
-    HDH = pmax(tmp_threshold - tmpf, 0),
-    CDH = pmax(tmpf - tmp_threshold, 0),
+    tmpf2 = (tmpf - tmp_threshold)^2,
+    HDH   = pmax(tmp_threshold - tmpf, 0),
+    HDH2  = HDH^2,
+    CDH   = pmax(tmpf - tmp_threshold, 0),
+    CDH2  = CDH^2,
     
     # season indicator
     is_winter = ifelse(month %in% c(12,1,2,3), 1, 0),
@@ -130,7 +133,7 @@ month_dummy <- month_dummy[, colnames(month_dummy) != "month_fJan", drop = FALSE
 ```{r}
 df_xreg <- cbind(
   df_weather_full %>%
-    select(ts_hour_utc, HDH, CDH, is_winter, is_summer, winter_HDH, winter_wind, summer_CDH, summer_dew) %>%
+    select(ts_hour_utc, tmpf2, HDH, CDH, HDH2, CDH2, p01m, is_winter, is_summer, winter_HDH, winter_wind, summer_CDH, summer_dew) %>%
     rename(timestamp = ts_hour_utc),
   month_dummy
 ) %>%
@@ -199,7 +202,7 @@ plot_base <- df_1819 %>%
   select(timestamp, all_of(y_col)) %>%
   inner_join(
     df_xreg_1819 %>%
-      select(timestamp, winter_HDH, winter_wind, summer_CDH, summer_dew),
+      select(timestamp, tmpf2, winter_HDH, winter_wind, summer_CDH, summer_dew),
     by = "timestamp"
   ) %>%
   arrange(timestamp)
@@ -215,6 +218,7 @@ plot_df <- plot_base %>%
       series,
       levels = c(
         y_col,
+        "tmpf^2,",
         "winter_HDH",
         "winter_wind",
         "summer_CDH",
@@ -236,11 +240,14 @@ ggplot(plot_df, aes(x = timestamp, y = value)) +
 **multicollinearity**
 
 ```{r}
+weather_features <- df_xreg_train %>%
+  select(winter_HDH, winter_wind, summer_CDH, summer_dew)
+
 library(usdm)
-vif(weather_vars)
+vif(weather_features)
 ```
 
-safe to have all of four weather coraviates as xreg.
+summer_CDH and summer_dew can not be used at the same time.
 
 
 
@@ -263,7 +270,7 @@ plot_residual_diag <- function(fit, timestamp) {
   par(mfrow = c(2,2), mar = c(4,4,2,1))
   plot(timestamp, res, type="l"); abline(h=0,lty=2)
   hist(res, breaks=50, prob=TRUE); lines(density(res, na.rm=TRUE))
-  acf(res, lag.max=24, na.action=na.pass)
+  acf(res, lag.max=24, na.action=na.pass, ylim=c(-0.2,0.2))
   pacf(res, lag.max=24, na.action=na.pass)
   par(mfrow=c(1,1))
 }
@@ -296,13 +303,14 @@ plot_train_valid_forecast <- function(
   y_train,           # data.frame, must contain timestamp
   y_train_ts,        # ts or numeric (train actual values)
   y_val,             # data.frame, must contain timestamp
-  y_valid_vec,       # numeric (validation actual values)
+  y_val_ts,          # ts or numeric (validation actual values)
   fc_obj,            # forecast object from forecast()
   ci_level = 2,      # which column of lower/upper to use (e.g., 2 for 95%)
   lookback_days = 7*12  # how many days before split to show
 ) {
-  # --- forecast vector ---
+  # --- forecast & actual vector ---
   yhat_valid <- as.numeric(fc_obj$mean)
+  y_valid_vec <- as.numeric(y_val_ts)
 
   # --- align length (safety) ---
   h <- length(yhat_valid)
@@ -375,43 +383,31 @@ plot_train_valid_forecast <- function(
 }
 ```
 
-
 #### Try 1
 
 ```{r}
-# auto.arima -> ARIMA(1,1,0)(2,1,2)[24]
-weather_vars <- c("winter_HDH", "winter_wind", "summer_CDH", "summer_dew")
-Xreg_train_subset1 <- xreg_train[, weather_vars, drop = FALSE]
+weather_vars_subset1 <- c("tmpf2")
+Xreg_input <- xreg_train[, weather_vars_subset1, drop = FALSE]
 
-fit_sarima_D1_1 <- auto.arima(
+fit_sarimax_D1_1 <- Arima(
   y_train_ts,
-  xreg = Xreg_train_subset1,
-  seasonal = TRUE,
-  stepwise = TRUE,
-  approximation = TRUE,
-  d = 0, D = 1,
-  max.p = 4, max.q = 4,
-  max.P = 4, max.Q = 4
+  xreg = Xreg_input,
+  order = c(4,0,3),
+  seasonal = list(order = c(2,1,1), period = 24),
+  method = "ML",
 )
 
-summary(fit_sarima_D1_1)
+summary(fit_sarimax_D1_1)
 ```
 
-**Check Residuals**
-```{r fig.width=12, fig.height=6}
-plot_residual_diag(fit_sarima_D1_1, y_train$timestamp)
-```
-```{r}
-plot_residual_acf_longlag(fit_sarima_D1_1)
-```
 
 
 **Validation**
 ```{r}
-weather_vars <- weather_vars
-xreg_val_subset <- xreg_val[, weather_vars, drop = FALSE]
+weather_vars <- weather_vars_subset1
 
-fc_sarima_D1_1 <- forecast(fit_sarima_D1_1, h = H_val, xreg = xreg_val_subset)
+xreg_val_subset <- xreg_val[, weather_vars, drop = FALSE]
+fc_sarima_D1_1 <- forecast(fit_sarimax_D1_1, h = H_val, xreg = xreg_val_subset)
 ```
 
 
@@ -424,25 +420,89 @@ plot_train_valid_forecast(
   y_train = y_train,
   y_train_ts = y_train_ts,
   y_val = y_val,
-  y_valid_vec = y_valid_vec,
+  y_val_ts = y_val_ts,
   fc_obj = fc_sarima_D1_1,
   ci_level = 2,
   lookback_days = 7*12
 )
 ```
 
+
 #### Try 2
+
 ```{r}
-fit_sarimax_D1 <- Arima(y_train,
-  xreg = X_train[, "temp2", drop = FALSE],
+library(dplyr)
+
+y_col <- "electricity_demand"
+weather_vars_subset1 <- c("winter_HDH", "winter_wind", "CDH2", "p01m")
+
+lm_df <- y_train %>%
+  select(timestamp, y = all_of(y_col)) %>%
+  left_join(
+    df_xreg_train %>% select(timestamp, all_of(weather_vars_subset1)),
+    by = "timestamp"
+  )
+
+fit_lm_log <- lm(
+  log(y) ~ winter_HDH + winter_wind + CDH2 + p01m,
+  data = lm_df
+)
+
+summary(fit_lm_log)
+```
+
+
+
+```{r}
+weather_vars_subset2 <- c("winter_HDH","CDH2", "p01m")
+Xreg_input <- xreg_train[, weather_vars_subset2, drop = FALSE]
+
+fit_sarimax_D1_2 <- Arima(
+  y_train_ts,
+  xreg = Xreg_input,
   order = c(4,0,3),
   seasonal = list(order = c(2,1,1), period = 24),
   method = "CSS-ML",
   lambda = 0
 )
 
-summary(fit_sarimax_D1)
+summary(fit_sarimax_D1_2)
 ```
+
+**Check Residuals**
+```{r fig.width=12, fig.height=6}
+plot_residual_diag(fit_sarimax_D1_2, y_train$timestamp)
+```
+```{r}
+plot_residual_acf_longlag(fit_sarimax_D1_2)
+```
+
+
+**Validation**
+```{r}
+weather_vars <- weather_vars_subset2
+
+xreg_val_subset <- xreg_val[, weather_vars, drop = FALSE]
+fc_sarima_D1_2 <- forecast(fit_sarimax_D1_2, h = H_val, xreg = xreg_val_subset)
+```
+
+
+```{r}
+calc_metrics(y_val_ts, fc_sarima_D1_2$mean)
+```
+
+```{r fig.width=12, fig.height=4}
+plot_train_valid_forecast(
+  y_train = y_train,
+  y_train_ts = y_train_ts,
+  y_val = y_val,
+  y_val_ts = y_val_ts,
+  fc_obj = fc_sarima_D1_2,
+  ci_level = 2,
+  lookback_days = 7*12
+)
+```
+
 
 ### Forecast output on Test Data
 
