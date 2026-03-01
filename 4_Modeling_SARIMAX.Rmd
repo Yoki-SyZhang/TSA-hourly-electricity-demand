@@ -434,7 +434,7 @@ plot_train_valid_forecast(
 library(dplyr)
 
 y_col <- "electricity_demand"
-weather_vars_subset1 <- c("winter_HDH", "winter_wind", "CDH2", "p01m")
+weather_vars_subset2 <- c("winter_HDH", "winter_wind", "CDH2", "p01m")
 
 lm_df <- y_train %>%
   select(timestamp, y = all_of(y_col)) %>%
