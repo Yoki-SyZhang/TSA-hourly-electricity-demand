@@ -1,0 +1,134 @@
+---
+title: "5_Modeling_TBATS"
+author: "Wenbo Zhao"
+date: "2026-02-28"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+```{r}
+# load data
+library(forecast)
+library(lubridate)
+
+df_1819 <- readRDS("data/train_test_split/df_1819.rds")
+df_20   <- readRDS("data/train_test_split/df_20.rds")
+
+# 1) Build hourly ts with daily seasonality
+y_1819 <- ts(df_1819$electricity_demand, frequency = 24)
+
+# 2) 80/20 split WITHOUT dropping ts attributes
+n <- length(y_1819)
+n_train <- floor(0.8 * n)
+
+y_train <- window(y_1819, end = time(y_1819)[n_train])
+y_test  <- window(y_1819, start = time(y_1819)[n_train + 1])
+
+# 3) Quick sanity check (should be 24, not 1)
+start(y_train); end(y_train); frequency(y_train)
+start(y_test);  end(y_test);  frequency(y_test)
+```
+
+
+```{r}
+spec <- spec.pgram(
+  y_1819,
+  log = "no",
+  detrend = FALSE,
+  demean = TRUE,
+  taper = 0.1,
+  plot = TRUE
+)
+```
+```{r}
+top_idx <- order(spec$spec, decreasing = TRUE)[1:10]
+data.frame(
+  frequency = spec$freq[top_idx],
+  period = 1/spec$freq[top_idx],
+  power = spec$spec[top_idx]
+)
+```
+
+
+```{r}
+fit_tbats <- tbats(
+  y_train,
+  seasonal.periods = c(24, 168),
+   use.trend = TRUE,
+  use.box.cox = TRUE
+)
+```
+
+```{r}
+h_test <- length(y_test)
+
+fc_test <- forecast(fit_tbats, h = h_test)
+
+plot(fc_test)
+lines(y_test, col = "red")
+```
+```{r}
+accuracy(fc_test, y_test)
+```
+
+# try other frequency
+```{r}
+fit_tbats2 <- tbats(
+  y_train,
+  seasonal.periods = c(24,168, 187.5),
+   use.trend = TRUE,
+  use.box.cox = TRUE
+)
+```
+
+```{r}
+h_test <- length(y_test)
+
+fc_test2 <- forecast(fit_tbats2, h = h_test)
+
+plot(fc_test2)
+lines(y_test, col = "red")
+```
+```{r}
+accuracy(fc_test2, y_test)
+```
+```{r}
+fit_tbats3 <- tbats(
+  y_train,
+  seasonal.periods = c(24, 168, 187.5, 375),
+   use.trend = TRUE,
+  use.box.cox = TRUE
+)
+```
+
+```{r}
+h_test <- length(y_test)
+
+fc_test3 <- forecast(fit_tbats3, h = h_test)
+
+plot(fc_test2)
+lines(y_test, col = "red")
+```
+```{r}
+accuracy(fc_test3, y_test)
+```
+
+
+
+
+
+
+
+
+
+
+
+
