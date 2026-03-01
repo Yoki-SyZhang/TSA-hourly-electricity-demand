@@ -443,12 +443,12 @@ lm_df <- y_train %>%
     by = "timestamp"
   )
 
-fit_lm_log <- lm(
-  log(y) ~ winter_HDH + winter_wind + CDH2 + p01m,
+fit_lm <- lm(
+  y ~ winter_HDH + winter_wind + CDH2 + p01m,
   data = lm_df
 )
 
-summary(fit_lm_log)
+summary(fit_lm)
 ```
 
 
