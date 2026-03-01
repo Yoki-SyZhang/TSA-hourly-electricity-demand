@@ -1,0 +1,603 @@
+---
+title: "Cook County Electricity Demand Time Series Modeling - SARIMAX"
+output: html_document
+---
+
+```{r,warning=F,message=F}
+library(forecast)
+library(readr)
+library(tseries)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(future.apply)
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+```
+
+```{r}
+# load data
+df_1819 <- readRDS("data/train_test_split/df_1819.rds")
+df_1819 <- df_1819[-1, ]
+df_20   <- readRDS("data/train_test_split/df_20.rds")
+
+cutoff <- ymd_hms("2020-01-01 00:00:00", tz="UTC")
+```
+
+
+
+### Covariate: Weather 
+
+```{r}
+weather_path <- "data/raw/ORD_weather.csv"  
+
+df_weather <- read.csv(weather_path, stringsAsFactors = FALSE) %>%
+  filter(valid != "valid") %>%
+  mutate(
+    timestamp = ymd_hm(valid, tz = "UTC"),
+    tmpf = parse_number(tmpf),
+    dwpf = parse_number(dwpf),
+    sped = parse_number(sped),
+    p01m = parse_number(p01m),
+    ts_hour_utc = round_date(timestamp, "hour")
+  )
+head(df_weather,2)
+```
+- station: air monitoring station.
+- valid: utc timestamp as string
+- tmpf: air temperature [F]
+- dwpf: dew point [F], the temperature to which air must be cooled to become saturated with water vapor (
+ relative humidity)
+- sped: wind speed [mph]
+- p01m: 1 hour precipitation [mm]
+
+
+**tidy up the weaather df to be aligned with elec demand df**
+```{r}
+# round to hour
+df_weather_hr <- df_weather %>%
+  group_by(ts_hour_utc) %>%
+  summarise(
+    across(c(tmpf, dwpf, sped, p01m),
+           ~ mean(.x, na.rm = TRUE)),
+    .groups = "drop"
+  ) %>%
+  arrange(ts_hour_utc)
+
+# A complete hourly UTC time grid
+full_hours <- tibble(
+  ts_hour_utc = seq(min(df_weather_hr$ts_hour_utc),
+                    max(df_weather_hr$ts_hour_utc),
+                    by = "hour")
+)
+
+df_weather_full <- full_hours %>%
+  left_join(df_weather_hr, by = "ts_hour_utc")
+
+# Missing weather are linearly interpolated.
+df_weather_full <- df_weather_full %>%
+  arrange(ts_hour_utc) %>%
+  mutate(t = as.numeric(ts_hour_utc)) %>%
+  mutate(
+    across(
+      c(tmpf, dwpf, sped, p01m),
+      ~ approx(t[!is.na(.x)],
+               .x[!is.na(.x)],
+               t,
+               rule = 2)$y
+    )
+  ) %>%
+  select(-t)
+```
+
+**Feature engineering on weather data**
+```{r}
+tmp_threshold <-50
+
+df_weather_full <- df_weather_full %>%
+  mutate(
+    # time
+    month = month(ts_hour_utc),
+    
+    # Heating Degree Hour & Cooling Degree Hour
+    tmpf2 = (tmpf - tmp_threshold)^2,
+    HDH   = pmax(tmp_threshold - tmpf, 0),
+    HDH2  = HDH^2,
+    CDH   = pmax(tmpf - tmp_threshold, 0),
+    CDH2  = CDH^2,
+    
+    # season indicator
+    is_winter = ifelse(month %in% c(12,1,2,3), 1, 0),
+    is_summer = ifelse(month %in% c(6,7,8,9), 1, 0),
+    
+    # interaction
+    winter_HDH  = HDH * is_winter,
+    winter_wind = sped * is_winter,
+    summer_CDH  = CDH * is_summer,
+    summer_dew  = dwpf * is_summer
+  )
+```
+
+
+### Fourier
+```{r fig.width=12, fig.height=6}
+y <- ts(df_1819$electricity_demand, frequency = 24)
+sp <- spec.pgram(y, taper=0.1, detrend=TRUE, log="no", plot=TRUE)
+
+abline(v = c(1, 1/7, 1/365), lty = 3, col = "red")  # daily, weekly, annual (cycles/day)
+```
+The x-axis frequency is cycles per day here. We can see splikes at f = 1 = Daily seasonality, f = 1/7 = Weekly seasonality, f = 1/365 ≈ 0.00274 = Annual seasonality, f ≈ 2 = 12-hour harmonic.
+
+
+
+```{r fig.width=12, fig.height=4}
+sp <- spec.pgram(y, taper=0.1, detrend=TRUE, plot=FALSE)
+plot(sp$freq/24, sp$spec, type="l", xlim=c(0, 1/10),
+     xlab="Frequency (cycles per hour)", ylab="Spectral density",
+     main="Periodogram (zoomed: low frequencies)")
+abline(v=c(1/24,1/168,1/8760), lty=3, col="red")
+```
+For the x-axis, frequency is divided by 24 to show seasonsality in an hourly way. spikes occur ot 1/24 and 1/168, indicating daily and weekly seasonality, while the spike at 1/12 is daily 2nd harmonic. There is also a strong low-frequency structure. might be trend and annual.
+
+```{r}
+sp <- spec.pgram(y, taper=0.1, detrend=TRUE, plot=FALSE)
+
+# convert to cycles/hour
+freq_hour <- sp$freq / 24
+spec_val  <- sp$spec
+
+# Top 10 spike
+idx <- order(spec_val, decreasing = TRUE)[1:15]
+
+data.frame(
+  freq_cycles_per_hour = freq_hour[idx],
+  period_hours = 1 / freq_hour[idx],
+  spectral_density = spec_val[idx]
+)
+```
+
+Spike at 84h is weekly harmonic. "Annual" might be mixed in the low frequencies.
+
+
+
+### Final Xreg
+
+```{r}
+df_xreg <- df_weather_full %>%
+    select(ts_hour_utc, tmpf2, HDH, CDH,winter_HDH,winter_wind, summer_CDH,p01m) %>%
+    rename(timestamp = ts_hour_utc)
+
+df_xreg_1819 <- df_xreg %>% filter(timestamp < cutoff)
+df_xreg_20   <- df_xreg %>% filter(timestamp >= cutoff)
+```
+
+
+
+
+
+## Train - Validation - Test
+
+### split train validation on 1819 data
+
+
+```{r}
+H_val <- 24 * 7 * 2  # 2 weeks
+
+# 1) assure time sorting
+df_1819      <- df_1819 %>% arrange(timestamp)
+df_xreg_1819 <- df_xreg_1819 %>% arrange(timestamp)
+
+# 2) Alignment check
+stopifnot(nrow(df_1819) == nrow(df_xreg_1819))
+stopifnot(all(df_1819$timestamp == df_xreg_1819$timestamp))
+
+# 3) train/val index
+n_1819 <- nrow(df_1819)
+idx_train <- 1:(n_1819 - H_val)
+idx_val   <- (n_1819 - H_val + 1):n_1819
+
+y_train <- df_1819[idx_train, ]
+y_val   <- df_1819[idx_val, ]
+
+df_xreg_train <- df_xreg_1819[idx_train, ]
+df_xreg_val   <- df_xreg_1819[idx_val, ]
+```
+
+
+**SARIMAX input dtype：ts + xreg matrix**
+```{r}
+y_col <- "electricity_demand"  
+
+# ts: hourly, frequency=24 
+y_train_msts <- msts(y_train[[y_col]], seasonal.periods = c(24, 168))
+y_val_msts   <- msts(y_val[[y_col]]  , seasonal.periods = c(24, 168))
+y_train_ts   <- ts(y_train[[y_col]], frequency = 24)
+y_val_ts     <- ts(y_val[[y_col]]  , frequency = 24)
+
+# xreg: drop timestamp, as.matrix
+xreg_train <- df_xreg_train %>% select(-timestamp) %>% as.matrix()
+xreg_val   <- df_xreg_val   %>% select(-timestamp) %>% as.matrix()
+
+stopifnot(length(y_train_ts) == nrow(xreg_train))
+stopifnot(length(y_val_ts)   == nrow(xreg_val))
+stopifnot(ncol(xreg_train)   == ncol(xreg_val))
+stopifnot(all(colnames(xreg_train) == colnames(xreg_val)))
+```
+
+
+
+
+### Assumptions made for the modeling
+
+(S)ARIMAX models require future values of exogenous covariates when generating forecasts. In this application, weather features such as temperature and precipitation are used as an external regressor. Since reliable weather forecasts are available and generally highly accurate over short horizons, we assume that future temperature forecasts are equal to the realized temperature values. Therefore, weather features are treated as known when producing demand forecasts.
+
+We assume the covariate can solve the heteroscedasticity issue.
+
+The weather data is actually the records from ord station in Chicago, here we assume the weather condition in Chicago and Cook County are identical.
+
+### Train - Validation
+
+
+#### Create func for validation
+
+```{r}
+plot_residual_diag <- function(fit, timestamp) {
+  res <- residuals(fit)
+  par(mfrow = c(2,2), mar = c(4,4,2,1))
+  plot(timestamp, res, type="l"); abline(h=0,lty=2)
+  hist(res, breaks=50, prob=TRUE); lines(density(res, na.rm=TRUE))
+  acf(res, lag.max=24, na.action=na.pass, ylim=c(-0.2,0.2))
+  pacf(res, lag.max=24, na.action=na.pass)
+  par(mfrow=c(1,1))
+}
+
+plot_residual_acf_longlag <- function(fit,ylim) {
+  res <- residuals(fit)
+  par(mfrow=c(2,1), mar=c(4,4,2,1))
+  acf(res, lag.max=24*7*4, na.action=na.pass, ylim=c(-ylim,ylim))
+  abline(v=c(7,14,21,28), col="red", lty=3)
+  pacf(res, lag.max=24*7*4, na.action=na.pass)
+  abline(v=c(7,14,21,28), col="red", lty=3)
+  par(mfrow=c(1,1))
+}
+```
+
+
+```{r}
+calc_metrics <- function(actual, forecast_mean) {
+  actual <- as.numeric(actual)
+  forecast_mean <- as.numeric(forecast_mean)
+  
+  c(
+    RMSE = sqrt(mean((actual - forecast_mean)^2)),
+    MAE  = mean(abs(actual - forecast_mean)),
+    MAPE = mean(abs((actual - forecast_mean) / actual)) * 100
+  )
+}
+
+plot_train_valid_forecast <- function(
+  y_train,           # data.frame, must contain timestamp
+  y_train_ts,        # ts or numeric (train actual values)
+  y_val,             # data.frame, must contain timestamp
+  y_val_ts,          # ts or numeric (validation actual values)
+  fc_obj,            # forecast object from forecast()
+  ci_level = 2,      # which column of lower/upper to use (e.g., 2 for 95%)
+  lookback_days = 7*12  # how many days before split to show
+) {
+  # --- forecast & actual vector ---
+  yhat_valid <- as.numeric(fc_obj$mean)
+  y_valid_vec <- as.numeric(y_val_ts)
+
+  # --- align length (safety) ---
+  h <- length(yhat_valid)
+
+  # timestamps for validation/forecast must be length h
+  ts_val <- y_val$timestamp[seq_len(h)]
+
+  # --- 1. train actual ---
+  train_df <- data.frame(
+    timestamp = y_train$timestamp,
+    value     = as.numeric(y_train_ts),
+    type      = "Train"
+  )
+
+  # --- 2. validation actual (aligned) ---
+  valid_df <- data.frame(
+    timestamp = ts_val,
+    value     = y_valid_vec[seq_len(h)],
+    type      = "Validation"
+  )
+
+  # --- 3. forecast df (aligned) ---
+  forecast_df <- data.frame(
+    timestamp = ts_val,
+    Forecast  = yhat_valid,
+    Lower     = fc_obj$lower[seq_len(h), ci_level],
+    Upper     = fc_obj$upper[seq_len(h), ci_level]
+  )
+
+  split_time <- min(ts_val)
+
+  # --- 4. plot ---
+  ggplot2::ggplot() +
+    ggplot2::geom_line(
+      data = train_df,
+      ggplot2::aes(x = timestamp, y = value),
+      color = "black", linewidth = 0.6
+    ) +
+    ggplot2::geom_line(
+      data = valid_df,
+      ggplot2::aes(x = timestamp, y = value),
+      color = "black", linewidth = 0.6
+    ) +
+    ggplot2::geom_ribbon(
+      data = forecast_df,
+      ggplot2::aes(x = timestamp, ymin = Lower, ymax = Upper),
+      fill = "pink", alpha = 0.3
+    ) +
+    ggplot2::geom_line(
+      data = forecast_df,
+      ggplot2::aes(x = timestamp, y = Forecast),
+      color = "red", linewidth = 0.7
+    ) +
+    ggplot2::geom_vline(
+      xintercept = split_time,
+      linetype = "dashed", color = "blue"
+    ) +
+    ggplot2::theme_minimal() +
+    ggplot2::labs(
+      title = "Train + Validation Forecast",
+      x = "Time",
+      y = "Electricity Demand"
+    ) +
+    ggplot2::coord_cartesian(
+      xlim = c(
+        split_time - lubridate::days(lookback_days),
+        max(ts_val)
+      )
+    )
+}
+```
+
+#### Try 1
+
+```{r}
+weather_vars_subset1 <- c("winter_HDH","winter_wind", "summer_CDH","p01m")
+Xreg_input <- xreg_train[, weather_vars_subset1, drop = FALSE]
+
+K1 <- c(12, 6)
+X_fourier <- fourier(y_train_msts, K=K1)
+
+fit_arimax_fourier_1 <- auto.arima(
+  y_train_msts,
+  xreg = cbind(Xreg_input,X_fourier),
+  seasonal = FALSE
+)
+
+summary(fit_arimax_fourier_1)
+```
+
+**Check Residuals**
+```{r fig.width=12, fig.height=6}
+plot_residual_diag(fit_arimax_fourier_1, y_train$timestamp)
+```
+```{r}
+plot_residual_acf_longlag(fit_arimax_fourier_1)
+```
+
+Obiviously that, acf and pacf all have significant weekly lags, indicating that seasonality = 168 should be considered. 
+
+This shows the limitation of SARIMAX can only have one seasonality.
+
+
+**Validation**
+```{r}
+weather_vars <- weather_vars_subset1
+xreg_val_subset <- xreg_val[, weather_vars, drop = FALSE]
+
+X_fourier_val <- fourier(y_train_msts, K = K1, h = H_val)
+X_val_all <- cbind(xreg_val_subset, X_fourier_val)
+
+fc_arimax_fourier_1 <- forecast(fit_arimax_fourier_1, h = H_val, xreg = X_val_all)
+```
+
+
+```{r}
+calc_metrics(y_val_ts, fc_arimax_fourier_1$mean)
+```
+
+```{r fig.width=12, fig.height=4}
+plot_train_valid_forecast(
+  y_train = y_train,
+  y_train_ts = y_train_ts,
+  y_val = y_val,
+  y_val_ts = y_val_ts,
+  fc_obj = fc_arimax_fourier_1,
+  ci_level = 2,
+  lookback_days = 7*12
+)
+```
+
+#### Try 2: SARIMA(…)[24] + weekly Fourier
+
+```{r}
+# auto.arima -> (3,0,1)(3,1,2)[24] with "tmpf2"
+weather_vars_subset2 <- c("winter_HDH", "summer_CDH","p01m")
+
+K_week <- 3 
+X_week_fourier_train <- fourier(y_train_msts, K = c(0, K_week))
+Xreg_input <- cbind(xreg_train[, weather_vars_subset2, drop=FALSE], X_week_fourier_train)
+
+fit_sarimax_D1_weekF_1 <- Arima(
+  y_train_ts,
+  xreg = Xreg_input,
+  order = c(3,0,1),
+  seasonal = list(order = c(2,1,1), period = 24),
+  method = "CSS-ML",
+)
+
+summary(fit_sarimax_D1_weekF_1)
+```
+
+**Check Residuals**
+```{r fig.width=12, fig.height=6}
+plot_residual_diag(fit_sarimax_D1_weekF_1, y_train$timestamp)
+```
+```{r}
+plot_residual_acf_longlag(fit_sarimax_D1_weekF_1,0.2)
+```
+
+
+**Validation**
+```{r}
+weather_vars <- weather_vars_subset2
+
+X_week_fourier_val <- fourier(y_train_msts, K = c(0, K_week), h = H_val)
+
+xreg_val_input <- cbind(
+  xreg_val[, weather_vars, drop = FALSE],
+  X_week_fourier_val
+)
+
+fc_sarimax_D1_weekF_1 <- forecast(fit_sarimax_D1_weekF_1, h = H_val, xreg = xreg_val_input)
+```
+
+```{r}
+calc_metrics(y_val_ts, fc_sarimax_D1_weekF_1$mean)
+```
+
+```{r fig.width=12, fig.height=4}
+plot_train_valid_forecast(
+  y_train = y_train,
+  y_train_ts = y_train_ts,
+  y_val = y_val,
+  y_val_ts = y_val_ts,
+  fc_obj = fc_sarimax_D1_weekF_1,
+  ci_level = 2,
+  lookback_days = 7*12
+)
+```
+#### Try 3: SARIMA(…)[24] + weekly Fourier K = 5
+
+```{r}
+# auto.arima -> (3,0,1)(3,1,2)[24] with "tmpf2"
+weather_vars_subset2 <- c("winter_HDH", "summer_CDH","p01m")
+
+K_week2 <- 5
+X_week_fourier_train <- fourier(y_train_msts, K = c(0, K_week2))
+Xreg_input <- cbind(xreg_train[, weather_vars_subset2, drop=FALSE], X_week_fourier_train)
+
+fit_sarimax_D1_weekF_2 <- Arima(
+  y_train_ts,
+  xreg = Xreg_input,
+  order = c(3,0,1),
+  seasonal = list(order = c(2,1,1), period = 24),
+  method = "CSS-ML",
+)
+
+summary(fit_sarimax_D1_weekF_2)
+```
+
+**Check Residuals**
+```{r fig.width=12, fig.height=6}
+plot_residual_diag(fit_sarimax_D1_weekF_2, y_train$timestamp)
+```
+```{r}
+plot_residual_acf_longlag(fit_sarimax_D1_weekF_2,0.2)
+```
+
+
+**Validation**
+```{r}
+weather_vars <- weather_vars_subset2
+
+X_week_fourier_val <- fourier(y_train_msts, K = c(0, K_week2), h = H_val)
+
+xreg_val_input <- cbind(
+  xreg_val[, weather_vars, drop = FALSE],
+  X_week_fourier_val
+)
+
+fc_sarimax_D1_weekF_2 <- forecast(fit_sarimax_D1_weekF_2, h = H_val, xreg = xreg_val_input)
+```
+
+```{r}
+calc_metrics(y_val_ts, fc_sarimax_D1_weekF_2$mean)
+```
+
+```{r fig.width=12, fig.height=4}
+plot_train_valid_forecast(
+  y_train = y_train,
+  y_train_ts = y_train_ts,
+  y_val = y_val,
+  y_val_ts = y_val_ts,
+  fc_obj = fc_sarimax_D1_weekF_2,
+  ci_level = 2,
+  lookback_days = 7*12
+)
+```
+
+### Forecast output on Test Data
+
+#### Train the model on whole training data
+
+```{r}
+y_1819_ts   <- ts(df_1819$electricity_demand, frequency = 24)
+y_1819_msts <- msts(df_1819$electricity_demand, seasonal.periods = c(24,168))
+
+
+Xreg_1819 <- df_xreg_1819 %>% select(winter_HDH, summer_CDH, p01m) %>% as.matrix()
+X_week_fourier_1819 <- fourier(y_1819_msts, K = c(0, 5))
+xreg_train <- cbind(Xreg_1819, X_week_fourier_1819)
+
+stopifnot(nrow(xreg_train) == length(y_1819_ts))
+
+final_fit_sarimax_fourier <- Arima(
+  y_1819_ts,
+  xreg = xreg_train,
+  order = c(3,0,1),
+  seasonal = list(order = c(2,1,1), period = 24),
+  method = "CSS-ML"
+)
+```
+
+#### Forecast on test
+```{r}
+# forecast horizon
+h_fc <- 24*7*4
+
+Xreg_test <- df_xreg_20 %>%
+  slice(seq_len(h_fc)) %>%
+  select(all_of(colnames(Xreg_1819))) %>%  
+  as.matrix()
+
+X_week_future <- fourier(y_1819_msts, K = c(0, 5), h = h_fc)
+xreg_future <- cbind(Xreg_test, X_week_future)
+
+stopifnot(nrow(xreg_future) == h_fc)
+
+fc_test <- forecast(final_fit_sarimax_fourier, h = h_fc, xreg = xreg_future)
+
+forecast_df_test <- data.frame(
+  timestamp = df_xreg_20$timestamp[seq_len(h_fc)],
+  Forecast  = as.numeric(fc_test$mean),
+  Lower     = fc_test$lower[,2],  # 95%
+  Upper     = fc_test$upper[,2]
+)
+```
+
+
+#### Save forecast results of test data
+
+```{r}
+modeling_method <- "SARIMAX_w_fourier"
+forecast_path  <- paste0("data/test_forecast/", modeling_method, "_20Jan.csv")
+
+write.csv(
+  forecast_df_test,
+  forecast_path,
+  row.names = FALSE
+)
+```
+
+
+
