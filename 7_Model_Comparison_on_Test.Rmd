@@ -1,0 +1,128 @@
+---
+title: "Cook County Electricity Demand Time Series - Models Comparison"
+output: html_notebook
+---
+
+
+```{r,warning=F,message=F}
+library(dplyr)
+library(readr)
+library(lubridate)
+library(tidyr)
+library(ggplot2)
+Sys.setlocale("LC_ALL", "en_US.UTF-8")
+
+t0   <- ymd_hms("2020-01-01 00:00:00", tz = "UTC")
+h_fc <- 24*7*4   # 672 hours
+```
+
+
+## Load Forecast data
+
+```{r}
+df_20 <- readRDS("data/train_test_split/df_20.rds") %>%
+  select(timestamp, Actual = electricity_demand) %>%
+  filter(timestamp >= t0) %>%
+  arrange(timestamp) %>%
+  slice_head(n = h_fc)
+
+read_fc <- function(file) {
+  read_csv(file, show_col_types = FALSE) %>%
+    mutate(timestamp = as.POSIXct(timestamp, tz = "UTC")) %>%
+    filter(timestamp >= t0) %>%
+    arrange(timestamp) %>%
+    slice_head(n = h_fc) %>%
+    select(timestamp, Forecast, Lower, Upper)
+}
+
+path <- "data/test_forecast/"
+fc_ets     <- read_fc(paste0(path, "ETS_Sample_20Jan.csv"))
+fc_sarimax <- read_fc(paste0(path, "SARIMAX_20Jan.csv"))
+fc_fourier <- read_fc(paste0(path, "SARIMAX_w_fourier_20Jan.csv"))
+```
+
+
+```{r}
+stopifnot(nrow(df_20) == h_fc,
+          nrow(fc_ets) == h_fc,
+          nrow(fc_sarimax) == h_fc,
+          nrow(fc_fourier) == h_fc)
+
+stopifnot(identical(df_20$timestamp, fc_ets$timestamp),
+          identical(df_20$timestamp, fc_sarimax$timestamp),
+          identical(df_20$timestamp, fc_fourier$timestamp))
+```
+
+```{r}
+rmse <- function(a, f) sqrt(mean((a - f)^2, na.rm = TRUE))
+mae  <- function(a, f) mean(abs(a - f), na.rm = TRUE)
+mape <- function(a, f) mean(abs((a - f)/a), na.rm = TRUE) * 100
+
+eval_one <- function(fc_tbl, name) {
+  d <- df_20 %>% inner_join(fc_tbl, by = "timestamp")
+  tibble(
+    Model = name,
+    n = nrow(d),
+    RMSE = rmse(d$Actual, d$Forecast),
+    MAE  = mae(d$Actual, d$Forecast),
+    MAPE = mape(d$Actual, d$Forecast)
+  )
+}
+
+metrics <- bind_rows(
+  eval_one(fc_ets, "ETS"),
+  eval_one(fc_sarimax, "SARIMAX"),
+  eval_one(fc_fourier, "SARIMAX + Fourier")
+)
+
+metrics
+```
+
+
+```{r fig.width=12}
+make_plot_df <- function(fc_tbl) {
+  df_20 %>%
+    inner_join(fc_tbl, by = "timestamp")   # 用 join 保证对齐
+}
+
+plot_fc_ci <- function(plot_df, title) {
+  ggplot(plot_df, aes(x = timestamp)) +
+    
+    geom_ribbon(aes(ymin = Lower, ymax = Upper),
+                alpha = 0.25) +
+    
+    geom_line(aes(y = Actual, color = "Actual"),
+              linewidth = 0.6) +
+    
+    geom_line(aes(y = Forecast, color = "Forecast"),
+              linewidth = 0.7) +
+    
+    scale_color_manual(
+      values = c("Actual" = "black",
+                 "Forecast" = "red")
+    ) +
+    
+    theme_minimal() +
+    labs(title = title,
+         x = "Time (UTC)",
+         y = "Electricity Demand",
+         color = "")
+}
+```
+
+
+```{r fig.width=12, fig.height=6}
+p1 <- plot_fc_ci(make_plot_df(fc_ets),     "ETS: Forecast vs Actual (95% CI)")
+p2 <- plot_fc_ci(make_plot_df(fc_sarimax), "SARIMAX: Forecast vs Actual (95% CI)")
+p3 <- plot_fc_ci(make_plot_df(fc_fourier), "SARIMAX + Fourier: Forecast vs Actual (95% CI)")
+
+p1
+p2
+p3
+```
+
+
+
+
+
+
