@@ -1,0 +1,244 @@
+---
+title: "Cook County Electricity Demand Time Series Modeling - TBATS"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r,warning=F,message=F}
+library(forecast)
+library(readr)
+library(tseries)
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+library(future.apply)
+```
+
+
+```{r}
+df_1819 <- readRDS("/Users/lizhihong/Downloads/df_1819.rds")
+df_20   <- readRDS("/Users/lizhihong/Downloads/df_20.rds")
+
+# Build hourly ts with daily seasonality
+y_1819 <- ts(df_1819$electricity_demand, frequency = 24)
+
+# 80/20 split 
+n <- length(y_1819)
+n_train <- floor(0.8 * n)
+
+y_train <- window(y_1819, end = time(y_1819)[n_train])
+y_test  <- window(y_1819, start = time(y_1819)[n_train + 1])
+
+# Quick sanity check
+#start(y_train); end(y_train); frequency(y_train)
+#start(y_test);  end(y_test);  frequency(y_test)
+```
+
+## Spectrum Analysis
+
+```{r}
+spec <- spec.pgram(
+  y_1819,
+  log = "no",
+  detrend = FALSE,
+  demean = TRUE,
+  taper = 0.1,
+  plot = TRUE
+)
+
+top_idx <- order(spec$spec, decreasing = TRUE)[1:15]
+spec_table <- data.frame(
+  freq_raw   = spec$freq[top_idx],
+  period_raw = 1/spec$freq[top_idx],
+  power      = spec$spec[top_idx]
+)
+
+
+
+print(spec_table)
+```
+
+We observe that some estimated periods (e.g., 7.14 or 375) do not exactly match the theoretical seasonal cycles such as one week (7 days) or one year (365 days). This discrepancy arises from spectral estimation noise, finite sample effects, and slight calendar irregularities (e.g., leap years or uneven monthly lengths), which cause the dominant frequencies to deviate from exact integers. Since our data are recorded hourly, we therefore impose interpretable and structurally meaningful seasonal periods—daily (1×24), weekly (7×24), and yearly (365×24). These fixed seasonal cycles are then specified in the TBATS model to ensure stable and practically meaningful seasonal decomposition during training.
+
+## TBATS Candidates
+
+```{r}
+S_DAILY  <- 24
+S_WEEKLY <- 168
+
+S_YEARLY <- 8766  # 365.25*24
+
+CANDIDATES <- list(
+  tbats_24_168 = list(seasonal.periods=c(S_DAILY, S_WEEKLY),         use.trend=FALSE, use.box.cox=TRUE,  biasadj=FALSE),
+  tbats_24_168_8766 = list(seasonal.periods=c(S_DAILY, S_WEEKLY, S_YEARLY), use.trend=FALSE, use.box.cox=TRUE,  biasadj=FALSE),
+  tbats_24_168_8766_biasadj = list(seasonal.periods=c(S_DAILY, S_WEEKLY, S_YEARLY), use.trend=FALSE, use.box.cox=TRUE,  biasadj=TRUE),
+  tbats_24_168_8766_trend = list(seasonal.periods=c(S_DAILY, S_WEEKLY, S_YEARLY), use.trend=TRUE,  use.box.cox=TRUE,  biasadj=FALSE)
+)
+```
+
+## Fit + Forecast + Evaluate
+
+```{r}
+h_test <- length(y_test)
+
+fit_one_tbats <- function(y, cfg) {
+  tbats(
+    y,
+    seasonal.periods = cfg$seasonal.periods,
+    use.trend = cfg$use.trend,
+    use.box.cox = cfg$use.box.cox
+  )
+}
+
+results <- list()
+
+for (name in names(CANDIDATES)) {
+  cfg <- CANDIDATES[[name]]
+
+  cat("\n--- Fitting:", name,
+      " seasonal =", paste(cfg$seasonal.periods, collapse=","),
+      " trend =", cfg$use.trend,
+      " boxcox =", cfg$use.box.cox,
+      " biasadj =", cfg$biasadj, "\n")
+
+  fit <- fit_one_tbats(y_train, cfg)
+  fc  <- forecast(fit, h = h_test, biasadj = cfg$biasadj)
+  acc <- accuracy(fc, y_test)
+
+  results[[name]] <- list(cfg=cfg, fit=fit, forecast=fc, accuracy=acc)
+
+  plot(fc, main=paste0("TBATS Forecast - ", name))
+  lines(y_test, col="red")
+  dev.off()
+
+  print(acc)
+}
+```
+
+## Model Selection (by Test RMSE)
+```{r}
+score_df <- do.call(rbind, lapply(names(results), function(nm) {
+  acc <- results[[nm]]$accuracy
+  data.frame(
+    model = nm,
+    test_RMSE = acc["Test set", "RMSE"],
+    test_MAE  = acc["Test set", "MAE"],
+    test_MAPE = acc["Test set", "MAPE"],
+    stringsAsFactors = FALSE
+  )
+})) %>% arrange(test_RMSE)
+
+print(score_df)
+
+best_name <- score_df$model[1]
+best_cfg  <- results[[best_name]]$cfg
+cat("\n>>> Best model =", best_name, "\n")
+print(best_cfg)
+```
+From the forecast comparison, tbats_24_168_8766 (biasadj = FALSE) produces forecasts that track the weekly and daily seasonal fluctuations more closely and yields the lowest test RMSE and MAPE among the candidate models. When biasadj = TRUE, the back-transformation inflates the forecast level, leading to systematic over-prediction and larger test errors. The model without annual seasonality (24,168 only) under-fits longer-term variation, while adding trend causes instability and explosive forecasts. Since earlier testing showed no significant deterministic trend in the data, trend = FALSE avoids unnecessary level drift and improves generalization.
+
+
+
+## Forecast output on Test Data
+
+### Train the model on whole training data
+
+```{r}
+y_1819_full <- ts(df_1819$electricity_demand, frequency = 24)
+
+fit_tbats_final <- tbats(
+  y_1819_full,
+  seasonal.periods = c(24, 168, 8766),
+  use.trend = FALSE,
+  use.box.cox = TRUE
+)
+```
+
+### Forecast on test
+
+```{r}
+
+h_fc <- 24 * 7 * 4
+start_2020 <- ymd_hms("2020-01-01 00:00:00", tz = "UTC")
+
+ts_2020jan <- seq(from = start_2020, by = "hour", length.out = h_fc)
+
+fc_2020jan <- forecast(
+  fit_tbats_final,
+  h = h_fc,
+  level = 95,
+  biasadj = FALSE  
+)
+
+forecast_df_2020jan <- data.frame(
+  timestamp = ts_2020jan,
+  Forecast  = as.numeric(fc_2020jan$mean),
+  Lower95   = as.numeric(fc_2020jan$lower[,1]),
+  Upper95   = as.numeric(fc_2020jan$upper[,1])
+)
+
+head(forecast_df_2020jan)
+tail(forecast_df_2020jan)
+```
+
+```{r}
+plot(fc_2020jan, main = "TBATS Forecast: 2020-01 (first 4 weeks)")
+
+df_20 <- df_20 %>% mutate(timestamp = ymd_hms(timestamp, tz="UTC")) %>% arrange(timestamp)
+y_true_2020_ts <- ts(
+  df_true_2020jan$electricity_demand,
+  start = tsp(y_1819_full)[2] + 1/frequency(y_1819_full),
+  frequency = 24
+)
+
+lines(
+  y_true_2020_ts,
+  col = adjustcolor("red", alpha.f = 0.5), 
+  lwd = 1.5
+)
+```
+
+
+```{r}
+df_1819$timestamp <- ymd_hms(df_1819$timestamp, tz = "UTC")
+df_20$timestamp   <- ymd_hms(df_20$timestamp, tz = "UTC")
+
+# 18、19-1
+df_jan_1819 <- df_1819 %>%
+  filter(month(timestamp) == 1)
+
+# 2020-1
+df_jan_2020 <- df_20 %>%
+  filter(month(timestamp) == 1)
+
+summary(df_jan_1819$electricity_demand)
+summary(df_jan_2020$electricity_demand)
+
+sd(df_jan_1819$electricity_demand, na.rm = TRUE)
+sd(df_jan_2020$electricity_demand, na.rm = TRUE)
+```
+Although January 2018/2019 and January 2020 have similar means, their variability differs: the standard deviation drops from about 839 to 636, indicating lower volatility in 2020. TBATS learns seasonal structure and amplitude from the training data (2018–2019), so it projects historically larger fluctuations into 2020. When the actual variance decreases, the model appears to “miss” short-term movements, even though it correctly captures the daily and weekly seasonal patterns. This reflects a structural shift in variance rather than a failure of the seasonal model.
+
+
+```{r}
+forecast_df_2020jan_export <- forecast_df_2020jan %>%
+  mutate(
+    timestamp = as.POSIXct(timestamp, tz = "UTC"),
+    timestamp = format(timestamp, "%Y-%m-%d %H:%M:%S")
+  ) %>%
+  select(timestamp, Forecast, Lower95, Upper95)
+
+write.csv(
+  forecast_df_2020jan_export,
+  "TBATS_2020Jan_Forecast.csv",
+  row.names = FALSE
+)
+```
+
+
+
+
+
+
+
