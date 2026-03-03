@@ -168,3 +168,12 @@ plot_fc_ci(fc_stlf,   "STLF: Forecast vs Actual (95% CI)")
 plot_fc_ci(fc_tslm,   "TSLM: Forecast vs Actual (95% CI)")
 ```
 
+```{r}
+df_snaive <- fc_to_plot_df(fc_snaive); df_snaive$Model <- "SNAIVE"
+df_mean   <- fc_to_plot_df(fc_mean);   df_mean$Model   <- "MEANF"
+df_naive  <- fc_to_plot_df(fc_naive);  df_naive$Model  <- "NAIVE"
+df_drift  <- fc_to_plot_df(fc_drift);  df_drift$Model  <- "DRIFT"
+
+df_stlf  <- fc_to_plot_df(fc_stlf);  df_stlf$Model  <- "stlf"
+df_tslm  <- fc_to_plot_df(fc_tslm);  df_tslm$Model  <- "tslm"
+```
